@@ -9,9 +9,10 @@ Current V1 behavior:
 - Refuses to immediately hit turret-covered wall contacts when a safer flank exists nearby.
 - Shares temporary siege targets so nearby attack groups converge on the same weak point.
 - Splits ranged attackers into a temporary support group when a safe bombardment position exists.
+- Falls back to a ranged cone-siege when no safe standoff exists, so spitters spread across multiple outer lanes instead of collapsing into one blob.
 - After a breach opens, splits melee attackers across nearby defending turrets instead of piling the whole wave into one target.
 - Prioritizes flamethrower turrets first, keeps spitters back from flame zones, and tries to fan melee approaches across safer lanes.
-- Reuses already open, no-longer-covered breaches for later attack groups instead of starting a fresh wall breach.
+- Reuses physically open breaches even when the interior is still defended, then prioritizes interior turrets before deeper exploit targets.
 
 Implementation notes:
 
@@ -25,11 +26,11 @@ Debugging / test arena:
 - `/abt-debug on|off|status|dump|clear` enables or disables capture, prints a live summary, refreshes debug files, or clears transient overlays and cached debug state.
 - `/abt-debug-arena wall-open|wall-covered-flank|closed-ring|spitter-siege|mixed-breach-siege|mixed-turret-breach|flame-turret-breach|breach-reuse` rebuilds a dedicated `abt-debug-arena` surface, teleports the issuing admin there, and spawns a reproducible enemy test group.
 - Debug output is written under `script-output/advanced-biter-tactics/` as `events.jsonl`, `latest-snapshot.json`, and `arena-manifest.json`.
-- `events.jsonl` is the primary AI-readable event stream; `latest-snapshot.json` captures current group and siege-site state; `arena-manifest.json` records scenario coordinates and expected event flow.
+- `events.jsonl` is the primary AI-readable event stream; `latest-snapshot.json` captures current group and siege-site state including support mode, cone lanes, and breach pressure; `arena-manifest.json` records scenario coordinates plus explicit expected support-mode / reuse metadata for the arena run.
 - `spitter-siege` is meant to show pure ranged breach widening from standoff range; `mixed-breach-siege` adds melee units that should hold position until the breach is at least 2 to 3 wall segments wide.
-- `mixed-turret-breach` focuses on a same-side west standoff, widening the breach first, and only then splitting melee attackers across multiple interior gun turrets.
-- `flame-turret-breach` focuses on west-facing flamethrower turrets with dedicated infinity-pipe fuel, wide melee approach lanes, and keeping spitters out of flame danger.
-- `breach-reuse` now runs as a two-wave scenario with an interior objective so the second wave should visibly reuse the already open breach instead of picking a new wall contact.
+- `mixed-turret-breach` focuses on a true safe west standoff: spitters must create breach pressure first, and only then should melee split across interior gun turrets.
+- `flame-turret-breach` focuses on west-facing flamethrower turrets with dedicated infinity-pipe fuel and a pre-breach ranged cone so spitters spread across outer lanes while focusing the same wall segment.
+- `breach-reuse` now runs as a two-wave scenario with interior gun turrets, so wave one should take the open breach and wave two should visibly reuse that same entry instead of starting a fresh wall contact.
 
 VS Code:
 
