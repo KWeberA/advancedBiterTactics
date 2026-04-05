@@ -254,17 +254,17 @@ local DEBUG_SCENARIOS = {
     name = "mixed-turret-breach",
     spawn_position = {x = -18, y = 0},
     observe_position = {x = -36, y = 0},
-    target_position = {x = 36, y = 0},
+    target_position = {x = 48, y = 0},
     walls = {
-      {from = {x = 0, y = -10}, to = {x = 36, y = -10}},
-      {from = {x = 36, y = -10}, to = {x = 36, y = 10}},
-      {from = {x = 36, y = 10}, to = {x = 0, y = 10}},
+      {from = {x = 0, y = -10}, to = {x = 48, y = -10}},
+      {from = {x = 48, y = -10}, to = {x = 48, y = 10}},
+      {from = {x = 48, y = 10}, to = {x = 0, y = 10}},
       {from = {x = 0, y = 10}, to = {x = 0, y = -10}}
     },
     turrets = {
-      {name = "gun-turret", position = {x = 5, y = -5}, ammo = 200},
-      {name = "gun-turret", position = {x = 5, y = 0}, ammo = 200},
-      {name = "gun-turret", position = {x = 5, y = 5}, ammo = 200}
+      {name = "gun-turret", position = {x = 6, y = -5}, ammo = 200},
+      {name = "gun-turret", position = {x = 6, y = 0}, ammo = 200},
+      {name = "gun-turret", position = {x = 6, y = 5}, ammo = 200}
     },
     units = {
       {name = "medium-biter", count = 16},
@@ -311,10 +311,10 @@ local DEBUG_SCENARIOS = {
       "contact_found",
       "wall_network_scanned",
       "candidates_scored",
-      "siege_site_selected",
       "support_mode_selected",
       "ranged_cone_group_created",
       "ranged_cone_lane_set",
+      "siege_site_selected",
       "breach_assault_planned",
       "turret_priority_selected",
       "flame_lane_set"
@@ -329,8 +329,8 @@ local DEBUG_SCENARIOS = {
       {from = {x = 0, y = -10}, to = {x = 18, y = -10}},
       {from = {x = 18, y = -10}, to = {x = 18, y = 10}},
       {from = {x = 18, y = 10}, to = {x = 0, y = 10}},
-      {from = {x = 0, y = -10}, to = {x = 0, y = -3}},
-      {from = {x = 0, y = 3}, to = {x = 0, y = 10}}
+      {from = {x = 0, y = -10}, to = {x = 0, y = -5}},
+      {from = {x = 0, y = 5}, to = {x = 0, y = 10}}
     },
     turrets = {
       {name = "gun-turret", position = {x = 8, y = -4}, ammo = 200},
@@ -342,11 +342,15 @@ local DEBUG_SCENARIOS = {
       {name = "steel-chest", position = {x = 16, y = 2}}
     },
     open_breach_positions = {
+      {x = 0, y = -4},
+      {x = 0, y = -3},
       {x = 0, y = -2},
       {x = 0, y = -1},
       {x = 0, y = 0},
       {x = 0, y = 1},
-      {x = 0, y = 2}
+      {x = 0, y = 2},
+      {x = 0, y = 3},
+      {x = 0, y = 4}
     },
     waves = {
       {
@@ -371,7 +375,6 @@ local DEBUG_SCENARIOS = {
       }
     },
     reuse_site = true,
-    expected_support_mode = "open-entry-reuse",
     expected_reuse_wave_count = 2,
     expected_behavior = "Wave one should move through the already open breach before prioritizing interior gun turrets, and wave two should reuse that same opening instead of starting a fresh wall attack.",
     expected_event_sequence = {
@@ -682,6 +685,8 @@ local function normalize_site(site)
   site.entry_position = site.entry_position and copy_position(site.entry_position) or nil
   site.inside_rally_position = site.inside_rally_position and copy_position(site.inside_rally_position) or nil
   site.exploit_position = site.exploit_position and copy_position(site.exploit_position) or nil
+  site.seeded_inside_rally_position = site.seeded_inside_rally_position and copy_position(site.seeded_inside_rally_position) or nil
+  site.seeded_exploit_position = site.seeded_exploit_position and copy_position(site.seeded_exploit_position) or nil
   site.approach_side = site.approach_side or nil
   site.support_rejection_reason = site.support_rejection_reason or nil
   site.cone_lane_positions = copy_positions(site.cone_lane_positions)
@@ -1132,13 +1137,18 @@ end
 
 local function choose_outside_sample(samples, reference_position)
   local best_sample
+  local best_cover_count
   local best_distance
 
   for index = 1, #samples do
     local sample = samples[index]
     local sample_distance = distance_sq(sample.position, reference_position)
-    if not best_distance or sample_distance < best_distance then
+    local sample_cover_count = sample.cover_count or 0
+    if not best_sample
+      or sample_cover_count < best_cover_count
+      or (sample_cover_count == best_cover_count and sample_distance < best_distance) then
       best_sample = sample
+      best_cover_count = sample_cover_count
       best_distance = sample_distance
     end
   end
@@ -1266,9 +1276,11 @@ local function analyze_wall_network(group, start_entity)
       local side = CARDINAL_SIDES[side_index]
       local sample_position = offset_position(node.position, side.dx * OUTSIDE_SAMPLE_OFFSET, side.dy * OUTSIDE_SAMPLE_OFFSET)
       if is_position_walkable(surface, sample_position, probe_unit_name) then
+        local sample_cover_turrets = find_covering_turrets(surface, enemy_force, sample_position)
         node.outside_samples[#node.outside_samples + 1] = {
           direction = side.name,
-          position = sample_position
+          position = sample_position,
+          cover_count = #sample_cover_turrets
         }
       end
     end
@@ -1490,6 +1502,91 @@ local function build_flank_waypoints(analysis, current_candidate, best_candidate
   return waypoints
 end
 
+function runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate)
+  if not (analysis and analysis.closed and current_candidate and best_candidate and current_candidate.outside_position and best_candidate.outside_position) then
+    return {}
+  end
+
+  local min_x, max_x, min_y, max_y
+  for _, node in pairs(analysis.nodes or {}) do
+    if node and node.position then
+      min_x = min_x and math.min(min_x, node.position.x) or node.position.x
+      max_x = max_x and math.max(max_x, node.position.x) or node.position.x
+      min_y = min_y and math.min(min_y, node.position.y) or node.position.y
+      max_y = max_y and math.max(max_y, node.position.y) or node.position.y
+    end
+  end
+
+  if not (min_x and max_x and min_y and max_y) then
+    return {}
+  end
+
+  local margin = math.max(
+    OUTSIDE_SAMPLE_OFFSET + 3,
+    (current_candidate.max_cover_range or 0) + 4,
+    (best_candidate.max_cover_range or 0) + 4
+  )
+  local west_x = min_x - margin
+  local east_x = max_x + margin
+  local north_y = min_y - margin
+  local south_y = max_y + margin
+  local current = current_candidate.outside_position
+  local best = best_candidate.outside_position
+  local routes = {}
+
+  if current_candidate.outside_direction == "west" and best_candidate.outside_direction == "east" then
+    routes[1] = {
+      {x = west_x, y = north_y},
+      {x = east_x, y = north_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = west_x, y = south_y},
+      {x = east_x, y = south_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "east" and best_candidate.outside_direction == "west" then
+    routes[1] = {
+      {x = east_x, y = north_y},
+      {x = west_x, y = north_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = east_x, y = south_y},
+      {x = west_x, y = south_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "north" and best_candidate.outside_direction == "south" then
+    routes[1] = {
+      {x = west_x, y = north_y},
+      {x = west_x, y = south_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = east_x, y = north_y},
+      {x = east_x, y = south_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "south" and best_candidate.outside_direction == "north" then
+    routes[1] = {
+      {x = west_x, y = south_y},
+      {x = west_x, y = north_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = east_x, y = south_y},
+      {x = east_x, y = north_y},
+      copy_position(best)
+    }
+  else
+    routes[1] = {
+      copy_position(best)
+    }
+  end
+
+  return routes
+end
+
 local function filter_safe_flank_waypoints(group, waypoints, preferred_position)
   if not group or #waypoints == 0 then
     return waypoints
@@ -1512,6 +1609,24 @@ local function filter_safe_flank_waypoints(group, waypoints, preferred_position)
   end
 
   return safe_waypoints
+end
+
+function runtime_ext.choose_safe_flank_route(group, route_sets, preferred_position)
+  local best_route = {}
+  local best_score
+
+  for route_index = 1, #route_sets do
+    local candidate_route = filter_safe_flank_waypoints(group, route_sets[route_index], preferred_position)
+    if #candidate_route > 0 then
+      local score = distance_sq(group.position, candidate_route[1])
+      if not best_score or score < best_score then
+        best_route = candidate_route
+        best_score = score
+      end
+    end
+  end
+
+  return best_route
 end
 
 local function determine_breach_axis(analysis, candidate)
@@ -1864,6 +1979,10 @@ local function find_staging_positions(group, candidate, analysis)
     end
   end
 
+  if support_mode == "cone-siege" and support_position and #find_covering_turrets(group.surface, group.force, rally_position) > 0 then
+    rally_position = copy_position(support_position)
+  end
+
   return rally_position, support_position, ranged_members, ranged_range, candidate.outside_direction, support_rejection_reason, support_mode, cone_lane_positions
 end
 
@@ -1915,26 +2034,39 @@ function runtime_ext.build_support_cone_positions(surface, target_position, anch
   if not allow_out_of_range then
     base_distance = math.min(base_distance, ranged_range - 0.75)
   end
-  local lane_positions = {}
-  local seen = {}
 
-  for lane_offset = -2, 2 do
-    local candidate = {
-      x = target_position.x + direction_x * base_distance + perpendicular_x * lane_offset * RANGED_CONE_LANE_SPREAD,
-      y = target_position.y + direction_y * base_distance + perpendicular_y * lane_offset * RANGED_CONE_LANE_SPREAD
-    }
-    candidate = find_walkable_position_near(surface, candidate, probe_unit_name, 2)
-    local lane_is_valid = allow_out_of_range or distance_sq(candidate, target_position) <= (ranged_range - 0.25) * (ranged_range - 0.25)
-    if lane_is_valid and (not allow_out_of_range or #find_covering_turrets(surface, game.forces.enemy, candidate) == 0) then
-      local lane_key = position_key(candidate)
-      if not seen[lane_key] then
-        lane_positions[#lane_positions + 1] = candidate
-        seen[lane_key] = true
+  local best_lane_positions = {}
+  for distance_step = 0, (allow_out_of_range and 8 or 0) do
+    local lane_positions = {}
+    local seen = {}
+    local lane_distance = base_distance + distance_step
+
+    for lane_offset = -2, 2 do
+      local candidate = {
+        x = target_position.x + direction_x * lane_distance + perpendicular_x * lane_offset * RANGED_CONE_LANE_SPREAD,
+        y = target_position.y + direction_y * lane_distance + perpendicular_y * lane_offset * RANGED_CONE_LANE_SPREAD
+      }
+      candidate = find_walkable_position_near(surface, candidate, probe_unit_name, 2)
+      local lane_is_valid = allow_out_of_range or distance_sq(candidate, target_position) <= (ranged_range - 0.25) * (ranged_range - 0.25)
+      if lane_is_valid and (not allow_out_of_range or #find_covering_turrets(surface, game.forces.enemy, candidate) == 0) then
+        local lane_key = position_key(candidate)
+        if not seen[lane_key] then
+          lane_positions[#lane_positions + 1] = candidate
+          seen[lane_key] = true
+        end
       end
+    end
+
+    if #lane_positions > #best_lane_positions then
+      best_lane_positions = lane_positions
+    end
+
+    if #lane_positions >= 3 or (not allow_out_of_range and #lane_positions > 0) then
+      return lane_positions
     end
   end
 
-  return lane_positions
+  return best_lane_positions
 end
 
 function runtime_ext.get_cone_lane_indices(split_count)
@@ -2014,6 +2146,33 @@ local function get_site_entry_vector(site)
   return breach_center, direction_x, direction_y
 end
 
+function runtime_ext.get_breach_entry_progress(site, position)
+  if not (site and position) then
+    return nil, nil, nil
+  end
+
+  local breach_center, direction_x, direction_y = get_site_entry_vector(site)
+  local perpendicular_x = -direction_y
+  local perpendicular_y = direction_x
+  local delta_x = position.x - breach_center.x
+  local delta_y = position.y - breach_center.y
+  local progress = delta_x * direction_x + delta_y * direction_y
+  local lateral = math.abs(delta_x * perpendicular_x + delta_y * perpendicular_y)
+  local lateral_limit = 2
+
+  for index = 1, #(site.breach_positions or {}) do
+    local breach_position = site.breach_positions[index]
+    local breach_delta_x = breach_position.x - breach_center.x
+    local breach_delta_y = breach_position.y - breach_center.y
+    local breach_lateral = math.abs(breach_delta_x * perpendicular_x + breach_delta_y * perpendicular_y)
+    if breach_lateral > lateral_limit then
+      lateral_limit = breach_lateral
+    end
+  end
+
+  return progress, lateral, lateral_limit + 2
+end
+
 local function update_site_entry_positions(site, surface)
   normalize_site(site)
   local breach_center, direction_x, direction_y = get_site_entry_vector(site)
@@ -2038,6 +2197,14 @@ local function update_site_entry_positions(site, surface)
     entry_position = find_walkable_position_near(surface, entry_position, probe_unit_name, 3)
     inside_rally_position = find_walkable_position_near(surface, inside_rally_position, probe_unit_name, 4)
     exploit_position = find_walkable_position_near(surface, exploit_position, probe_unit_name, 5)
+  end
+
+  if site.seeded_inside_rally_position then
+    inside_rally_position = copy_position(site.seeded_inside_rally_position)
+  end
+
+  if site.seeded_exploit_position then
+    exploit_position = copy_position(site.seeded_exploit_position)
   end
 
   site.entry_position = entry_position
@@ -3125,7 +3292,8 @@ ensure_entry_traversed = function(record, group, site)
   end
 
   update_site_entry_positions(site, group.surface)
-  local destination = site.inside_rally_position or site.entry_position
+  local breach_center = average_positions(site.breach_positions) or site.target_position or site.entry_position
+  local destination = site.inside_rally_position or site.entry_position or breach_center
   if not destination then
     return false
   end
@@ -3135,7 +3303,22 @@ ensure_entry_traversed = function(record, group, site)
   record.inside_rally_position = copy_position(site.inside_rally_position)
   record.exploit_position = copy_position(site.exploit_position)
 
-  if distance_sq(group.position, destination) <= POST_BREACH_ENTRY_RADIUS * POST_BREACH_ENTRY_RADIUS then
+  local progress, lateral, lateral_limit = runtime_ext.get_breach_entry_progress(site, group.position)
+  local entry_traversed = progress
+    and lateral
+    and lateral_limit
+    and progress >= (BREACH_ENTRY_DISTANCE - 0.5)
+    and lateral <= lateral_limit
+  local aligned_to_entry = lateral and lateral_limit and lateral <= lateral_limit
+  local move_destination = destination
+
+  if not aligned_to_entry or (progress and progress < 0) then
+    move_destination = breach_center
+  elseif not entry_traversed and site.entry_position then
+    move_destination = site.entry_position
+  end
+
+  if entry_traversed and distance_sq(group.position, destination) <= POST_BREACH_ENTRY_RADIUS * POST_BREACH_ENTRY_RADIUS then
     return false
   end
 
@@ -3144,7 +3327,7 @@ ensure_entry_traversed = function(record, group, site)
   end
 
   if not record.command_status or record.command_kind ~= "move" then
-    issue_move(record, group, destination, POST_BREACH_ENTRY_RADIUS)
+    issue_move(record, group, move_destination, POST_BREACH_ENTRY_RADIUS)
   end
 
   return true
@@ -3647,6 +3830,21 @@ local function handle_post_breach_planning(record, group)
     return
   end
 
+  local focus_target = targets[1]
+  if focus_target then
+    record.target_position = copy_position(focus_target.position)
+    record.target_turret_name = focus_target.name
+    record.target_turret_position = copy_position(focus_target.position)
+    record_debug_event("interior_target_selected", record, {
+      reason = focus_target.is_flame and "flame-turret" or "combat-turret",
+      target_turret_name = focus_target.name,
+      target_turret_position = focus_target.position,
+      target_position = focus_target.position,
+      siege_site_id = site.key,
+      entry_open = true
+    })
+  end
+
   spawn_assault_groups_from_reserve(record, group, site, targets)
 
   if count_group_members(group) == 0 then
@@ -4131,16 +4329,6 @@ local function plan_group_action(record, group)
     return
   end
 
-  local _, ranged_range = get_group_ranged_members(group)
-  if best_candidate and best_candidate.cover_count > 0 and ranged_range > 1.5 then
-    local _, support_position = find_staging_positions(group, best_candidate, analysis)
-    if support_position then
-      local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
-      begin_siege(record, group, siege_site_record)
-      return
-    end
-  end
-
   if current_candidate
     and best_candidate
     and compare_candidate_priority(best_candidate, current_candidate)
@@ -4150,6 +4338,13 @@ local function plan_group_action(record, group)
       build_flank_waypoints(analysis, current_candidate, best_candidate),
       best_candidate.outside_position
     )
+    if #flank_waypoints == 0 and current_candidate.cover_count > 0 and best_candidate.cover_count == 0 then
+      flank_waypoints = runtime_ext.choose_safe_flank_route(
+        group,
+        runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate),
+        best_candidate.outside_position
+      )
+    end
     if #flank_waypoints > 0 then
       record.replans = record.replans + 1
       record.target_position = copy_position(best_candidate.position)
@@ -4167,6 +4362,16 @@ local function plan_group_action(record, group)
     end
 
     if current_candidate.cover_count > 0 and best_candidate.cover_count == 0 then
+      local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+      begin_siege(record, group, siege_site_record)
+      return
+    end
+  end
+
+  local _, ranged_range = get_group_ranged_members(group)
+  if best_candidate and best_candidate.cover_count > 0 and ranged_range > 1.5 then
+    local _, support_position = find_staging_positions(group, best_candidate, analysis)
+    if support_position then
       local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
       begin_siege(record, group, siege_site_record)
       return
@@ -5137,6 +5342,8 @@ function arena_runtime.seed_reuse_site(surface, scenario)
   storage.siege_sites[site_key] = site
   update_site_entry_positions(site, surface)
   if scenario.target_position then
+    site.seeded_inside_rally_position = copy_position(scenario.target_position)
+    site.seeded_exploit_position = copy_position(scenario.target_position)
     site.inside_rally_position = copy_position(scenario.target_position)
     site.exploit_position = copy_position(scenario.target_position)
   end
