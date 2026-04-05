@@ -31,6 +31,7 @@ local BREACH_ENTRY_DISTANCE = 4
 local INSIDE_RALLY_DISTANCE = 6
 local BREACH_EXPLOIT_DISTANCE = 12
 local BREACH_CORRIDOR_DISTANCE = 6
+local POST_BREACH_ENTRY_RADIUS = 3
 local MAX_MELEE_PER_TURRET = 10
 local SUPPORT_FOLLOW_TRIGGER_DISTANCE = 6
 local SUPPORT_FOLLOW_DISTANCE = 5
@@ -43,6 +44,7 @@ local FLAME_HAZARD_RADIUS = 2.5
 local RANGED_CONE_GROUP_LIMIT = 3
 local RANGED_CONE_LANE_COUNT = 5
 local RANGED_CONE_LANE_SPREAD = 3
+local CONE_STAGING_SAFETY_BUFFER = 2
 
 local DEBUG_DIR = MOD_NAME
 local DEBUG_FILES = {
@@ -99,6 +101,8 @@ local DEBUG_EVENT_NAMES = {
 local count_open_breach_segments
 local get_site_for_record
 local process_debug_arena_waves
+local ensure_entry_traversed
+local command_debug
 local runtime_ext = {}
 local DEBUG_SCENARIOS = {
   ["wall-open"] = {
@@ -243,19 +247,19 @@ local DEBUG_SCENARIOS = {
   },
   ["mixed-turret-breach"] = {
     name = "mixed-turret-breach",
-    spawn_position = {x = -20, y = 2},
-    observe_position = {x = -34, y = 2},
-    target_position = {x = 14, y = 0},
+    spawn_position = {x = -18, y = 0},
+    observe_position = {x = -36, y = 0},
+    target_position = {x = 36, y = 0},
     walls = {
-      {from = {x = 0, y = -10}, to = {x = 24, y = -10}},
-      {from = {x = 24, y = -10}, to = {x = 24, y = 10}},
-      {from = {x = 24, y = 10}, to = {x = 0, y = 10}},
+      {from = {x = 0, y = -10}, to = {x = 36, y = -10}},
+      {from = {x = 36, y = -10}, to = {x = 36, y = 10}},
+      {from = {x = 36, y = 10}, to = {x = 0, y = 10}},
       {from = {x = 0, y = 10}, to = {x = 0, y = -10}}
     },
     turrets = {
-      {name = "gun-turret", position = {x = 18, y = -6}, ammo = 200},
-      {name = "gun-turret", position = {x = 20, y = 0}, ammo = 200},
-      {name = "gun-turret", position = {x = 18, y = 6}, ammo = 200}
+      {name = "gun-turret", position = {x = 5, y = -5}, ammo = 200},
+      {name = "gun-turret", position = {x = 5, y = 0}, ammo = 200},
+      {name = "gun-turret", position = {x = 5, y = 5}, ammo = 200}
     },
     units = {
       {name = "medium-biter", count = 16},
@@ -263,21 +267,14 @@ local DEBUG_SCENARIOS = {
       {name = "small-spitter", count = 6},
       {name = "medium-spitter", count = 4}
     },
-    expected_support_mode = "safe-standoff",
-    expected_behavior = "Spitters should hold a safe west-side standoff, create real breach pressure there, and only after the opening is wide enough should melee split onto the interior gun turrets.",
+    expected_behavior = "Front gun-turret coverage should make the group walk around the rectangle and choose the uncovered rear wall before starting the breach.",
     expected_event_sequence = {
       "group_registered",
       "contact_found",
       "wall_network_scanned",
       "candidates_scored",
-      "siege_site_selected",
-      "support_mode_selected",
-      "standoff_position_selected",
-      "breach_pressure_detected",
-      "breach_progress_updated",
-      "breach_assault_planned",
-      "turret_priority_selected",
-      "melee_split_created"
+      "flank_waypoint_set",
+      "attack_selected"
     }
   },
   ["flame-turret-breach"] = {
@@ -303,7 +300,7 @@ local DEBUG_SCENARIOS = {
       {name = "medium-spitter", count = 4}
     },
     expected_support_mode = "cone-siege",
-    expected_behavior = "Flamethrower turrets should force a pre-breach ranged cone: spitters spread across outer lanes while focusing the same wall section, and melee only fan out after a breach exists.",
+    expected_behavior = "Flamethrower turrets should force a pre-breach ranged cone that forms outside flame range first, then converges on the same wall section while melee waits for a breach.",
     expected_event_sequence = {
       "group_registered",
       "contact_found",
@@ -371,7 +368,7 @@ local DEBUG_SCENARIOS = {
     reuse_site = true,
     expected_support_mode = "open-entry-reuse",
     expected_reuse_wave_count = 2,
-    expected_behavior = "Wave one should take the already open breach and prioritize interior gun turrets first; wave two approaches from another side but should still reuse that opening instead of starting a fresh wall attack.",
+    expected_behavior = "Wave one should move through the already open breach before prioritizing interior gun turrets, and wave two should reuse that same opening instead of starting a fresh wall attack.",
     expected_event_sequence = {
       "arena_wave_spawned",
       "group_registered",
@@ -1413,6 +1410,30 @@ local function build_flank_waypoints(analysis, current_candidate, best_candidate
   return waypoints
 end
 
+local function filter_safe_flank_waypoints(group, waypoints, preferred_position)
+  if not group or #waypoints == 0 then
+    return waypoints
+  end
+
+  local safe_waypoints = {}
+  for index = 1, #waypoints do
+    local waypoint = waypoints[index]
+    if #find_covering_turrets(group.surface, group.force, waypoint) == 0 then
+      safe_waypoints[#safe_waypoints + 1] = waypoint
+    end
+  end
+
+  if #safe_waypoints == 0 then
+    return {}
+  end
+
+  if preferred_position and distance_sq(safe_waypoints[#safe_waypoints], preferred_position) > 1 then
+    safe_waypoints[#safe_waypoints + 1] = copy_position(preferred_position)
+  end
+
+  return safe_waypoints
+end
+
 local function determine_breach_axis(analysis, candidate)
   local node = analysis.nodes[candidate.key]
   if not node then
@@ -1716,11 +1737,18 @@ local function find_staging_positions(group, candidate, analysis)
     )
 
     local force_cone_siege = false
+    local cone_minimum_distance
+    local allow_out_of_range_cone = false
     for turret_index = 1, #(candidate.cover_turrets or {}) do
       local turret = candidate.cover_turrets[turret_index]
       if turret.valid and is_flamethrower_turret(turret) and ranged_range <= get_attack_range(turret) + 0.5 then
         force_cone_siege = true
-        break
+        local turret_distance_to_target = math.sqrt(distance_sq(turret.position, candidate.position))
+        cone_minimum_distance = math.max(
+          cone_minimum_distance or 0,
+          math.max(2, get_attack_range(turret) + CONE_STAGING_SAFETY_BUFFER - turret_distance_to_target)
+        )
+        allow_out_of_range_cone = true
       end
     end
 
@@ -1734,7 +1762,9 @@ local function find_staging_positions(group, candidate, analysis)
         fallback_support_position or safe_support_position or candidate.outside_position,
         preferred_side,
         analysis.probe_unit_name,
-        ranged_range
+        ranged_range,
+        cone_minimum_distance,
+        allow_out_of_range_cone
       )
 
       if cone_lane_positions and #cone_lane_positions > 0 then
@@ -1781,7 +1811,7 @@ local function find_walkable_position_near(surface, origin, probe_unit_name, sea
   return copy_position(origin)
 end
 
-function runtime_ext.build_support_cone_positions(surface, target_position, anchor_position, preferred_side, probe_unit_name, ranged_range)
+function runtime_ext.build_support_cone_positions(surface, target_position, anchor_position, preferred_side, probe_unit_name, ranged_range, minimum_base_distance, allow_out_of_range)
   if not (target_position and anchor_position and ranged_range and ranged_range > 1.5) then
     return {}
   end
@@ -1800,7 +1830,11 @@ function runtime_ext.build_support_cone_positions(surface, target_position, anch
 
   local perpendicular_x = -direction_y
   local perpendicular_y = direction_x
-  local base_distance = math.max(2, math.min(ranged_range - 0.75, math.sqrt(distance_sq(target_position, anchor_position))))
+  local anchor_distance = math.sqrt(distance_sq(target_position, anchor_position))
+  local base_distance = math.max(2, minimum_base_distance or 0, anchor_distance)
+  if not allow_out_of_range then
+    base_distance = math.min(base_distance, ranged_range - 0.75)
+  end
   local lane_positions = {}
   local seen = {}
 
@@ -1810,7 +1844,8 @@ function runtime_ext.build_support_cone_positions(surface, target_position, anch
       y = target_position.y + direction_y * base_distance + perpendicular_y * lane_offset * RANGED_CONE_LANE_SPREAD
     }
     candidate = find_walkable_position_near(surface, candidate, probe_unit_name, 2)
-    if distance_sq(candidate, target_position) <= (ranged_range - 0.25) * (ranged_range - 0.25) then
+    local lane_is_valid = allow_out_of_range or distance_sq(candidate, target_position) <= (ranged_range - 0.25) * (ranged_range - 0.25)
+    if lane_is_valid and (not allow_out_of_range or #find_covering_turrets(surface, game.forces.enemy, candidate) == 0) then
       local lane_key = position_key(candidate)
       if not seen[lane_key] then
         lane_positions[#lane_positions + 1] = candidate
@@ -2677,6 +2712,10 @@ local function issue_breach_exploit(record, group, site, reason)
   record.target_force_name = site.defense_force_name
   record.state = "breach-exploiting"
 
+  if ensure_entry_traversed(record, group, site) then
+    return
+  end
+
   local interior_target = runtime_ext.find_interior_target(site, group.surface)
   if interior_target then
     record.target_position = copy_position(interior_target.position)
@@ -2996,6 +3035,37 @@ local function start_post_breach_planning(record, group, reason)
     breach_required_segments = record.breach_required_segments,
     breach_open_segments = record.breach_open_segments
   })
+
+  return true
+end
+
+ensure_entry_traversed = function(record, group, site)
+  if not (site and site.entry_open) then
+    return false
+  end
+
+  update_site_entry_positions(site, group.surface)
+  local destination = site.inside_rally_position or site.entry_position
+  if not destination then
+    return false
+  end
+
+  record.entry_open = true
+  record.site_entry_position = copy_position(site.entry_position)
+  record.inside_rally_position = copy_position(site.inside_rally_position)
+  record.exploit_position = copy_position(site.exploit_position)
+
+  if distance_sq(group.position, destination) <= POST_BREACH_ENTRY_RADIUS * POST_BREACH_ENTRY_RADIUS then
+    return false
+  end
+
+  if command_finished(record, group) then
+    clear_command(record)
+  end
+
+  if not record.command_status or record.command_kind ~= "move" then
+    issue_move(record, group, destination, POST_BREACH_ENTRY_RADIUS)
+  end
 
   return true
 end
@@ -3488,6 +3558,10 @@ local function handle_post_breach_planning(record, group)
     clear_command(record)
   end
 
+  if ensure_entry_traversed(record, group, site) then
+    return
+  end
+
   if #targets == 0 then
     issue_breach_exploit(record, group, site, "no-local-turrets")
     return
@@ -3615,6 +3689,10 @@ local function handle_support_following(record, group)
         issue_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS)
       end
     end
+    return
+  end
+
+  if ensure_entry_traversed(record, group, site) then
     return
   end
 
@@ -3872,9 +3950,14 @@ end
 local function handle_breach_exploiting_state(record, group)
   local site = get_site_for_record(record)
   if command_finished(record, group) then
+    local previous_command_kind = record.command_kind
     clear_command(record)
-    set_group_autonomous(group)
-    remove_group_record(record.id, false, "breach-exploit-finished")
+    if site and previous_command_kind == "move" then
+      issue_breach_exploit(record, group, site, "breach-exploit-refresh")
+    else
+      set_group_autonomous(group)
+      remove_group_record(record.id, false, "breach-exploit-finished")
+    end
   elseif not record.command_status and site then
     issue_breach_exploit(record, group, site, "breach-exploit-refresh")
   end
@@ -3982,7 +4065,11 @@ local function plan_group_action(record, group)
     and best_candidate
     and compare_candidate_priority(best_candidate, current_candidate)
     and record.replans < MAX_REPLANS then
-    local flank_waypoints = build_flank_waypoints(analysis, current_candidate, best_candidate)
+    local flank_waypoints = filter_safe_flank_waypoints(
+      group,
+      build_flank_waypoints(analysis, current_candidate, best_candidate),
+      best_candidate.outside_position
+    )
     if #flank_waypoints > 0 then
       record.replans = record.replans + 1
       record.target_position = copy_position(best_candidate.position)
@@ -3996,6 +4083,12 @@ local function plan_group_action(record, group)
         selected_candidate_index = record.debug_selected_candidate_index
       })
       issue_move(record, group, flank_waypoints[1], 2)
+      return
+    end
+
+    if current_candidate.cover_count > 0 and best_candidate.cover_count == 0 then
+      local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+      begin_siege(record, group, siege_site_record)
       return
     end
   end
@@ -4404,7 +4497,7 @@ local function write_manual_dump(reason)
   write_arena_manifest()
 end
 
-local function command_debug(command)
+command_debug = function(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -4488,6 +4581,7 @@ local function command_debug(command)
   else
     game.print({"advanced-biter-tactics.debug-help"})
   end
+end
 end
 
 do
@@ -4998,6 +5092,8 @@ local function command_debug_arena(command)
   write_manual_dump("arena-created")
 end
 
+commands.add_command("abt-debug-arena", {"advanced-biter-tactics.command-help-arena"}, command_debug_arena)
+
 local function on_group_created(event)
   ensure_globals()
   local scenario
@@ -5067,16 +5163,14 @@ runtime_ext.on_entity_damaged = function(event)
   end
 end
 
-commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
-commands.add_command("abt-debug-arena", {"advanced-biter-tactics.command-help-arena"}, command_debug_arena)
-
 script.on_event(defines.events.on_unit_group_created, on_group_created)
 script.on_event(defines.events.on_unit_group_finished_gathering, on_group_finished)
 script.on_event(defines.events.on_ai_command_completed, on_ai_command_completed)
 script.on_event(defines.events.on_entity_damaged, runtime_ext.on_entity_damaged)
 script.on_nth_tick(PROCESS_INTERVAL, process_tracked_groups)
 end
-end
+
+commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
 
 script.on_init(repair_runtime_state)
 script.on_configuration_changed(repair_runtime_state)

@@ -28,9 +28,9 @@ Debugging / test arena:
 - Debug output is written under `script-output/advanced-biter-tactics/` as `events.jsonl`, `latest-snapshot.json`, and `arena-manifest.json`.
 - `events.jsonl` is the primary AI-readable event stream; `latest-snapshot.json` captures current group and siege-site state including support mode, cone lanes, and breach pressure; `arena-manifest.json` records scenario coordinates plus explicit expected support-mode / reuse metadata for the arena run.
 - `spitter-siege` is meant to show pure ranged breach widening from standoff range; `mixed-breach-siege` adds melee units that should hold position until the breach is at least 2 to 3 wall segments wide.
-- `mixed-turret-breach` focuses on a true safe west standoff: spitters must create breach pressure first, and only then should melee split across interior gun turrets.
-- `flame-turret-breach` focuses on west-facing flamethrower turrets with dedicated infinity-pipe fuel and a pre-breach ranged cone so spitters spread across outer lanes while focusing the same wall segment.
-- `breach-reuse` now runs as a two-wave scenario with interior gun turrets, so wave one should take the open breach and wave two should visibly reuse that same entry instead of starting a fresh wall contact.
+- `mixed-turret-breach` now focuses on front-side gun-turret danger zones versus an uncovered rear wall, so the group should walk around the rectangle before it starts the breach.
+- `flame-turret-breach` focuses on west-facing flamethrower turrets with dedicated infinity-pipe fuel and a pre-breach ranged cone that forms outside flame range before it presses the wall.
+- `breach-reuse` now runs as a two-wave scenario with interior gun turrets, so each wave should first traverse the already open breach and only then switch to interior targets.
 
 VS Code:
 
