@@ -102,6 +102,11 @@ local count_open_breach_segments
 local get_site_for_record
 local process_debug_arena_waves
 local ensure_entry_traversed
+local require_admin_or_server
+local parse_command_parameter
+local write_manual_dump
+local set_debug_enabled
+local clear_debug_runtime
 local command_debug
 local runtime_ext = {}
 local DEBUG_SCENARIOS = {
@@ -4437,7 +4442,7 @@ local function get_debug_status()
   }
 end
 
-local function set_debug_enabled(player_index, enabled)
+set_debug_enabled = function(player_index, enabled)
   ensure_globals()
 
   if player_index == 0 then
@@ -4452,7 +4457,7 @@ local function set_debug_enabled(player_index, enabled)
   end
 end
 
-local function clear_debug_runtime()
+clear_debug_runtime = function()
   ensure_globals()
   storage.debug.recent_events = {}
 
@@ -4467,7 +4472,7 @@ local function clear_debug_runtime()
   helpers.remove_path(DEBUG_DIR)
 end
 
-local function require_admin_or_server(command)
+require_admin_or_server = function(command)
   if not command.player_index then
     return nil, true
   end
@@ -4484,7 +4489,7 @@ local function require_admin_or_server(command)
   return player, false
 end
 
-local function parse_command_parameter(parameter)
+parse_command_parameter = function(parameter)
   local trimmed = (parameter or ""):match("^%s*(.-)%s*$")
   if trimmed == "" then
     return ""
@@ -4492,7 +4497,7 @@ local function parse_command_parameter(parameter)
   return helpers.multilingual_to_lower(trimmed)
 end
 
-local function write_manual_dump(reason)
+write_manual_dump = function(reason)
   write_latest_snapshot(reason)
   write_arena_manifest()
 end
