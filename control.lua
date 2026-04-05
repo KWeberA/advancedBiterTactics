@@ -62,6 +62,7 @@ local CARDINAL_SIDES = {
 
 local DEBUG_EVENT_NAMES = {
   group_registered = true,
+  arena_wave_spawned = true,
   contact_found = true,
   wall_network_scanned = true,
   candidates_scored = true,
@@ -69,7 +70,9 @@ local DEBUG_EVENT_NAMES = {
   flank_waypoint_set = true,
   siege_site_selected = true,
   support_group_created = true,
+  support_position_rejected = true,
   standoff_position_selected = true,
+  breach_progress_updated = true,
   breach_assault_planned = true,
   turret_priority_selected = true,
   melee_split_created = true,
@@ -84,6 +87,7 @@ local DEBUG_EVENT_NAMES = {
 
 local count_open_breach_segments
 local get_site_for_record
+local process_debug_arena_waves
 local DEBUG_SCENARIOS = {
   ["wall-open"] = {
     name = "wall-open",
@@ -227,19 +231,19 @@ local DEBUG_SCENARIOS = {
   },
   ["mixed-turret-breach"] = {
     name = "mixed-turret-breach",
-    spawn_position = {x = -18, y = 2},
-    observe_position = {x = -30, y = 2},
-    target_position = {x = 4, y = 0},
+    spawn_position = {x = -20, y = 2},
+    observe_position = {x = -34, y = 2},
+    target_position = {x = 12, y = 0},
     walls = {
-      {from = {x = 0, y = -8}, to = {x = 12, y = -8}},
-      {from = {x = 12, y = -8}, to = {x = 12, y = 8}},
-      {from = {x = 12, y = 8}, to = {x = 0, y = 8}},
-      {from = {x = 0, y = 8}, to = {x = 0, y = -8}}
+      {from = {x = 0, y = -10}, to = {x = 18, y = -10}},
+      {from = {x = 18, y = -10}, to = {x = 18, y = 10}},
+      {from = {x = 18, y = 10}, to = {x = 0, y = 10}},
+      {from = {x = 0, y = 10}, to = {x = 0, y = -10}}
     },
     turrets = {
-      {name = "gun-turret", position = {x = 5, y = -4}, ammo = 200},
-      {name = "gun-turret", position = {x = 8, y = 0}, ammo = 200},
-      {name = "gun-turret", position = {x = 5, y = 4}, ammo = 200}
+      {name = "gun-turret", position = {x = 12, y = -5}, ammo = 200},
+      {name = "gun-turret", position = {x = 15, y = 0}, ammo = 200},
+      {name = "gun-turret", position = {x = 12, y = 5}, ammo = 200}
     },
     units = {
       {name = "medium-biter", count = 16},
@@ -247,14 +251,16 @@ local DEBUG_SCENARIOS = {
       {name = "small-spitter", count = 6},
       {name = "medium-spitter", count = 4}
     },
-    expected_behavior = "After the breach opens, melee units should split across the interior gun turrets while spitters only follow once melee reaches turret contact.",
+    expected_behavior = "Spitters should stay on the west attack side, widen the breach from there, and only then should melee split across the interior gun turrets.",
     expected_event_sequence = {
       "group_registered",
       "contact_found",
       "wall_network_scanned",
       "candidates_scored",
       "siege_site_selected",
+      "standoff_position_selected",
       "support_group_created",
+      "breach_progress_updated",
       "breach_assault_planned",
       "turret_priority_selected",
       "melee_split_created"
@@ -262,19 +268,19 @@ local DEBUG_SCENARIOS = {
   },
   ["flame-turret-breach"] = {
     name = "flame-turret-breach",
-    spawn_position = {x = -18, y = 2},
-    observe_position = {x = -30, y = 2},
-    target_position = {x = 4, y = 0},
+    spawn_position = {x = -20, y = 2},
+    observe_position = {x = -34, y = 2},
+    target_position = {x = 16, y = 0},
     walls = {
-      {from = {x = 0, y = -8}, to = {x = 12, y = -8}},
-      {from = {x = 12, y = -8}, to = {x = 12, y = 8}},
-      {from = {x = 12, y = 8}, to = {x = 0, y = 8}},
-      {from = {x = 0, y = 8}, to = {x = 0, y = -8}}
+      {from = {x = 0, y = -10}, to = {x = 28, y = -10}},
+      {from = {x = 28, y = -10}, to = {x = 28, y = 10}},
+      {from = {x = 28, y = 10}, to = {x = 0, y = 10}},
+      {from = {x = 0, y = 10}, to = {x = 0, y = -10}}
     },
     turrets = {
-      {name = "flamethrower-turret", position = {x = 6, y = -3}, fluid = {name = "light-oil", amount = 400}},
-      {name = "flamethrower-turret", position = {x = 6, y = 3}, fluid = {name = "light-oil", amount = 400}},
-      {name = "gun-turret", position = {x = 9, y = 0}, ammo = 200}
+      {name = "flamethrower-turret", position = {x = 16, y = -4}, direction = defines.direction.west, fuel_name = "light-oil"},
+      {name = "flamethrower-turret", position = {x = 16, y = 4}, direction = defines.direction.west, fuel_name = "light-oil"},
+      {name = "gun-turret", position = {x = 22, y = 0}, ammo = 200}
     },
     units = {
       {name = "medium-biter", count = 18},
@@ -290,6 +296,7 @@ local DEBUG_SCENARIOS = {
       "candidates_scored",
       "siege_site_selected",
       "support_group_created",
+      "breach_progress_updated",
       "breach_assault_planned",
       "turret_priority_selected",
       "flame_lane_set"
@@ -299,20 +306,20 @@ local DEBUG_SCENARIOS = {
     name = "breach-reuse",
     spawn_position = {x = -20, y = 0},
     observe_position = {x = -30, y = 0},
-    target_position = {x = 6, y = 0},
+    target_position = {x = 11, y = 0},
     walls = {
-      {from = {x = 0, y = -8}, to = {x = 12, y = -8}},
-      {from = {x = 12, y = -8}, to = {x = 12, y = 8}},
-      {from = {x = 12, y = 8}, to = {x = 0, y = 8}},
-      {from = {x = 0, y = -8}, to = {x = 0, y = -3}},
-      {from = {x = 0, y = 3}, to = {x = 0, y = 8}}
+      {from = {x = 0, y = -10}, to = {x = 18, y = -10}},
+      {from = {x = 18, y = -10}, to = {x = 18, y = 10}},
+      {from = {x = 18, y = 10}, to = {x = 0, y = 10}},
+      {from = {x = 0, y = -10}, to = {x = 0, y = -3}},
+      {from = {x = 0, y = 3}, to = {x = 0, y = 10}}
     },
     turrets = {
     },
-    units = {
-      {name = "medium-biter", count = 10},
-      {name = "big-biter", count = 4},
-      {name = "small-spitter", count = 4}
+    structures = {
+      {name = "radar", position = {x = 10, y = 0}},
+      {name = "steel-chest", position = {x = 14, y = -2}},
+      {name = "steel-chest", position = {x = 14, y = 2}}
     },
     open_breach_positions = {
       {x = 0, y = -2},
@@ -321,12 +328,37 @@ local DEBUG_SCENARIOS = {
       {x = 0, y = 1},
       {x = 0, y = 2}
     },
+    waves = {
+      {
+        delay = 0,
+        spawn_position = {x = -20, y = 0},
+        target_position = {x = 11, y = 0},
+        units = {
+          {name = "medium-biter", count = 10},
+          {name = "big-biter", count = 4},
+          {name = "small-spitter", count = 4}
+        }
+      },
+      {
+        delay = 240,
+        spawn_position = {x = 9, y = 18},
+        target_position = {x = 11, y = 0},
+        units = {
+          {name = "medium-biter", count = 8},
+          {name = "big-biter", count = 4},
+          {name = "small-spitter", count = 3}
+        }
+      }
+    },
     reuse_site = true,
-    expected_behavior = "A new attack group should reuse the already open breach instead of starting a fresh wall attack.",
+    expected_behavior = "Wave one should enter through the seeded breach, and wave two should come from another side but still reuse the same opening instead of starting a new wall attack.",
     expected_event_sequence = {
+      "arena_wave_spawned",
       "group_registered",
       "breach_reused",
-      "attack_selected"
+      "attack_selected",
+      "arena_wave_spawned",
+      "breach_reused"
     }
   }
 }
@@ -512,6 +544,16 @@ local function average_positions(positions)
   }
 end
 
+local function get_side_definition(side_name)
+  for index = 1, #CARDINAL_SIDES do
+    if CARDINAL_SIDES[index].name == side_name then
+      return CARDINAL_SIDES[index]
+    end
+  end
+
+  return nil
+end
+
 local function append_unique_id(list, value)
   if not (list and value) then
     return
@@ -565,6 +607,8 @@ local function normalize_group_record(record)
   record.site_entry_position = record.site_entry_position and copy_position(record.site_entry_position) or nil
   record.inside_rally_position = record.inside_rally_position and copy_position(record.inside_rally_position) or nil
   record.exploit_position = record.exploit_position and copy_position(record.exploit_position) or nil
+  record.approach_side = record.approach_side or nil
+  record.support_rejection_reason = record.support_rejection_reason or nil
   record.lane_positions = copy_positions(record.lane_positions)
   record.hazard_positions = copy_positions(record.hazard_positions)
   record.reserve_registered = record.reserve_registered == true
@@ -596,11 +640,14 @@ local function normalize_site(site)
   site.entry_position = site.entry_position and copy_position(site.entry_position) or nil
   site.inside_rally_position = site.inside_rally_position and copy_position(site.inside_rally_position) or nil
   site.exploit_position = site.exploit_position and copy_position(site.exploit_position) or nil
+  site.approach_side = site.approach_side or nil
+  site.support_rejection_reason = site.support_rejection_reason or nil
   site.assault_targets = site.assault_targets or {}
   site.active_flame_turrets = site.active_flame_turrets or {}
   site.flame_hazard_bounds = site.flame_hazard_bounds or nil
   site.assault_group_ids = site.assault_group_ids or {}
   site.reserve_group_ids = site.reserve_group_ids or {}
+  site.wave_count = tonumber(site.wave_count) or 0
   site.probe_unit_name = site.probe_unit_name or UNIT_PROBE_FALLBACK
   return site
 end
@@ -705,8 +752,10 @@ local function serialize_site(site)
     key = site.key,
     surface = surface and surface.name or tostring(site.surface_index),
     target_position = serialize_position(site.target_position),
+    approach_side = site.approach_side,
     rally_position = serialize_position(site.rally_position),
     support_position = serialize_position(site.support_position),
+    support_rejection_reason = site.support_rejection_reason,
     breach_positions = serialize_positions(site.breach_positions),
     breach_attack_order = serialize_positions(site.breach_attack_order),
     breach_required_segments = site.breach_required_segments,
@@ -722,6 +771,7 @@ local function serialize_site(site)
     assault_group_ids = site.assault_group_ids,
     flame_hazard_bounds = serialize_bounds(site.flame_hazard_bounds),
     defense_force_name = site.defense_force_name,
+    wave_count = site.wave_count,
     expires_tick = site.expires_tick
   }
 end
@@ -744,8 +794,10 @@ local function serialize_record(record)
     last_seen_tick = record.last_seen_tick,
     group_position = serialize_position(group and group.position or record.last_position),
     target_position = serialize_position(record.target_position),
+    approach_side = record.approach_side,
     rally_position = serialize_position(record.rally_position),
     support_position = serialize_position(record.support_position),
+    support_rejection_reason = record.support_rejection_reason,
     site_entry_position = serialize_position(record.site_entry_position),
     inside_rally_position = serialize_position(record.inside_rally_position),
     exploit_position = serialize_position(record.exploit_position),
@@ -840,6 +892,7 @@ local function record_debug_event(event_name, record, extra)
     group_position = serialize_position(group and group.position or (record and record.last_position or nil)),
     target_position = serialize_position(extra and extra.target_position or (record and record.target_position or nil)),
     contact_position = serialize_position(extra and extra.contact_position or (record and record.last_contact_position or nil)),
+    approach_side = extra and extra.approach_side or (record and record.approach_side or nil),
     candidate_count = extra and extra.candidate_count or nil,
     selected_candidate_index = extra and extra.selected_candidate_index or (record and record.debug_selected_candidate_index or nil),
     replan_count = record and record.replans or nil,
@@ -853,6 +906,7 @@ local function record_debug_event(event_name, record, extra)
     assigned_melee_count = extra and extra.assigned_melee_count or nil,
     lane_index = extra and extra.lane_index or (record and record.lane_index or nil),
     hazard_score = extra and extra.hazard_score or nil,
+    support_rejection_reason = extra and extra.support_rejection_reason or (record and record.support_rejection_reason or nil),
     entry_open = extra and extra.entry_open or (record and record.entry_open or nil)
   }
 
@@ -1160,6 +1214,7 @@ local function make_candidate(node, reference_position)
     position = node.position,
     is_gate = node.is_gate,
     outside_position = copy_position(outside_sample.position),
+    outside_direction = outside_sample.direction,
     outside_samples = node.outside_samples,
     cover_count = node.cover_count,
     cover_turrets = node.cover_turrets,
@@ -1571,12 +1626,29 @@ local function find_staging_positions(group, candidate, analysis)
   local defense_force_name = candidate.entity.force.name
   local ranged_members, ranged_range = get_group_ranged_members(group)
   local max_rally_distance = math.min(RALLY_HARD_MAX_DISTANCE, math.max(RALLY_BASE_MAX_DISTANCE, candidate.max_cover_range + 6))
+  local preferred_side = candidate.outside_direction
+  local preferred_samples = {}
+  local support_rejection_reason
+
+  if preferred_side then
+    for index = 1, #candidate.outside_samples do
+      local sample = candidate.outside_samples[index]
+      if sample.direction == preferred_side then
+        preferred_samples[#preferred_samples + 1] = sample
+      end
+    end
+  end
+
+  if #preferred_samples == 0 then
+    preferred_samples = candidate.outside_samples
+    preferred_side = nil
+  end
 
   local rally_position = find_staging_position(
     group.surface,
     defense_force_name,
     candidate.position,
-    candidate.outside_samples,
+    preferred_samples,
     analysis.probe_unit_name,
     RALLY_MIN_DISTANCE,
     max_rally_distance
@@ -1592,15 +1664,18 @@ local function find_staging_positions(group, candidate, analysis)
       group.surface,
       defense_force_name,
       candidate.position,
-      candidate.outside_samples,
+      preferred_samples,
       analysis.probe_unit_name,
       2,
       math.max(2, math.floor(ranged_range - 0.5)),
       ranged_range - 0.5
     )
+    if not support_position then
+      support_rejection_reason = preferred_side and "no-safe-same-side-standoff" or "no-safe-standoff"
+    end
   end
 
-  return rally_position, support_position, ranged_members, ranged_range
+  return rally_position, support_position, ranged_members, ranged_range, candidate.outside_direction, support_rejection_reason
 end
 
 local function find_walkable_position_near(surface, origin, probe_unit_name, search_radius)
@@ -1631,7 +1706,15 @@ local function get_site_entry_vector(site)
   local breach_center = average_positions(site.breach_positions) or site.target_position or {x = 0, y = 0}
   local direction_x, direction_y = 0, 0
 
-  if site.rally_position then
+  if site.approach_side then
+    local side = get_side_definition(site.approach_side)
+    if side then
+      direction_x = -side.dx
+      direction_y = -side.dy
+    end
+  end
+
+  if direction_x == 0 and direction_y == 0 and site.rally_position then
     direction_x, direction_y = normalized_direction(site.rally_position, breach_center)
   end
 
@@ -2128,10 +2211,13 @@ local function register_group(group, role, parent_id, scenario)
   record.last_seen_tick = game.tick
   record.last_position = copy_position(group.position)
 
-  record_debug_event("group_registered", record, {
-    reason = "register",
-    scenario = record.scenario
-  })
+  if record.last_register_tick ~= game.tick then
+    record.last_register_tick = game.tick
+    record_debug_event("group_registered", record, {
+      reason = "register",
+      scenario = record.scenario
+    })
+  end
 
   return record
 end
@@ -2149,7 +2235,8 @@ local function make_site_key(surface_index, position)
 end
 
 local function get_or_create_siege_site(group, candidate, analysis)
-  local rally_position, support_position = find_staging_positions(group, candidate, analysis)
+  local rally_position, support_position, _, _, approach_side, support_rejection_reason =
+    find_staging_positions(group, candidate, analysis)
   local breach_plan = build_breach_plan(analysis, candidate)
   local site_key = make_site_key(group.surface.index, candidate.position)
   local site = storage.siege_sites[site_key]
@@ -2160,8 +2247,10 @@ local function get_or_create_siege_site(group, candidate, analysis)
       surface_index = group.surface.index,
       defense_force_name = candidate.entity.force.name,
       target_position = copy_position(candidate.position),
+      approach_side = approach_side,
       rally_position = copy_position(rally_position),
       support_position = support_position and copy_position(support_position) or nil,
+      support_rejection_reason = support_rejection_reason,
       breach_positions = copy_positions(breach_plan.positions),
       breach_attack_order = copy_positions(breach_plan.attack_order),
       breach_required_segments = breach_plan.required_segments,
@@ -2177,8 +2266,10 @@ local function get_or_create_siege_site(group, candidate, analysis)
     storage.siege_sites[site_key] = site
   else
     site.target_position = copy_position(candidate.position)
+    site.approach_side = approach_side
     site.rally_position = copy_position(rally_position)
     site.support_position = support_position and copy_position(support_position) or nil
+    site.support_rejection_reason = support_rejection_reason
     site.breach_positions = copy_positions(breach_plan.positions)
     site.breach_attack_order = copy_positions(breach_plan.attack_order)
     site.breach_required_segments = breach_plan.required_segments
@@ -2363,6 +2454,14 @@ local function update_breach_progress(record, surface)
     record.breach_positions,
     record.breach_required_segments
   )
+
+  if record.breach_open_segments ~= open_segments then
+    record_debug_event("breach_progress_updated", record, {
+      reason = open_segments > (record.breach_open_segments or 0) and "segment-opened" or "segment-regressed",
+      breach_open_segments = open_segments,
+      breach_required_segments = record.breach_required_segments
+    })
+  end
 
   record.breach_open_segments = open_segments
   return open_enough, open_segments
@@ -2728,7 +2827,7 @@ local function attach_support_group(record, site, ranged_members)
   record.support_spawned = true
 
   local support_group = record.group.surface.create_unit_group({
-    position = site.support_position,
+    position = record.group.position,
     force = record.group.force
   })
 
@@ -2774,8 +2873,10 @@ local function begin_siege(record, group, site)
   local reusable_entry = site.entry_open and site_has_open_entry(site, group.surface)
   record.target_position = copy_position(site.target_position)
   record.target_force_name = site.defense_force_name
+  record.approach_side = site.approach_side
   record.rally_position = copy_position(site.rally_position)
   record.support_position = site.support_position and copy_position(site.support_position) or nil
+  record.support_rejection_reason = site.support_rejection_reason
   record.breach_positions = copy_positions(site.breach_positions)
   record.breach_attack_order = copy_positions(site.breach_attack_order)
   record.breach_required_segments = site.breach_required_segments
@@ -2792,10 +2893,19 @@ local function begin_siege(record, group, site)
     record_debug_event("standoff_position_selected", record, {
       reason = "support-position",
       target_position = site.support_position,
-      siege_site_id = site.key
+      siege_site_id = site.key,
+      approach_side = site.approach_side
     })
     attach_support_group(record, site, ranged_members)
     record.waiting_for_breach = record.support_group_id ~= nil and site.breach_required_segments and site.breach_required_segments > 1
+  elseif ranged_range > 1.5 then
+    record_debug_event("support_position_rejected", record, {
+      reason = site.support_rejection_reason or "support-position-rejected",
+      target_position = site.rally_position,
+      siege_site_id = site.key,
+      approach_side = site.approach_side,
+      support_rejection_reason = site.support_rejection_reason
+    })
   end
 
   if count_group_members(group) == 0 then
@@ -2839,6 +2949,7 @@ end
 local function apply_site_to_record(record, site)
   normalize_site(site)
   record.siege_site_id = site.key
+  record.approach_side = site.approach_side
   record.breach_positions = copy_positions(site.breach_positions)
   record.breach_attack_order = copy_positions(site.breach_attack_order)
   record.breach_required_segments = site.breach_required_segments
@@ -3231,6 +3342,7 @@ end
 
 local function handle_breach_wait_state(record, group)
   local breach_open = update_breach_progress(record, group.surface)
+  local exposed = #find_covering_turrets(group.surface, group.force, group.position) > 0
 
   if breach_open then
     record.waiting_for_breach = false
@@ -3250,8 +3362,16 @@ local function handle_breach_wait_state(record, group)
     return
   end
 
-  if record.rally_position and distance_sq(group.position, record.rally_position) > 16 then
-    issue_move(record, group, record.rally_position, 3)
+  if record.rally_position and (distance_sq(group.position, record.rally_position) > 16 or exposed) then
+    if command_finished(record, group) then
+      clear_command(record)
+    elseif exposed and record.command_kind ~= "move" then
+      clear_command(record)
+    end
+
+    if not record.command_status or record.command_kind ~= "move" then
+      issue_move(record, group, record.rally_position, 3)
+    end
   end
 end
 
@@ -3454,8 +3574,11 @@ local function process_group_record(record_id)
   record.surface_name = group.surface.name
 
   if record.role ~= "support"
+    and record.role ~= "assault"
+    and record.role ~= "reserve"
     and group.is_unit_group
-    and group.state == defines.group_state.gathering then
+    and group.state == defines.group_state.gathering
+    and record.state == "tracking" then
     return
   end
 
@@ -3683,6 +3806,7 @@ end
 
 local function process_tracked_groups()
   ensure_globals()
+  process_debug_arena_waves()
   prune_siege_sites()
 
   local queue = storage.group_queue
@@ -3904,7 +4028,9 @@ local function command_debug(command)
 end
 
 do
-local function get_or_create_debug_surface()
+local arena_runtime = {}
+
+function arena_runtime.get_or_create_debug_surface()
   local surface = game.surfaces[DEBUG_ARENA_SURFACE_NAME]
   if surface and surface.valid then
     return surface
@@ -3934,7 +4060,7 @@ local function get_or_create_debug_surface()
   return surface
 end
 
-local function clear_debug_surface(surface)
+function arena_runtime.clear_debug_surface(surface)
   local entities = surface.find_entities()
   for index = 1, #entities do
     local entity = entities[index]
@@ -3962,7 +4088,7 @@ local function clear_debug_surface(surface)
   surface.set_tiles(tiles)
 end
 
-local function chart_debug_surface(surface, player)
+function arena_runtime.chart_debug_surface(surface, player)
   if player and player.valid then
     player.force.chart(surface, {
       left_top = {-DEBUG_ARENA_TILE_HALF_SIZE, -DEBUG_ARENA_TILE_HALF_SIZE},
@@ -3971,7 +4097,7 @@ local function chart_debug_surface(surface, player)
   end
 end
 
-local function iterate_line(from_position, to_position)
+function arena_runtime.iterate_line(from_position, to_position)
   local positions = {}
   local dx = to_position.x - from_position.x
   local dy = to_position.y - from_position.y
@@ -3987,12 +4113,12 @@ local function iterate_line(from_position, to_position)
   return positions
 end
 
-local function build_wall_segments(surface, force_name, scenario)
+function arena_runtime.build_wall_segments(surface, force_name, scenario)
   local wall_positions = {}
 
   for segment_index = 1, #scenario.walls do
     local segment = scenario.walls[segment_index]
-    local line_positions = iterate_line(segment.from, segment.to)
+    local line_positions = arena_runtime.iterate_line(segment.from, segment.to)
 
     for position_index = 1, #line_positions do
       local position = line_positions[position_index]
@@ -4023,7 +4149,7 @@ local function build_wall_segments(surface, force_name, scenario)
   return anchors
 end
 
-local function build_turrets(surface, force_name, scenario)
+function arena_runtime.build_turrets(surface, force_name, scenario)
   local turret_positions = {}
 
   for index = 1, #scenario.turrets do
@@ -4031,19 +4157,71 @@ local function build_turrets(surface, force_name, scenario)
     local turret = surface.create_entity({
       name = turret_data.name or "gun-turret",
       position = turret_data.position,
-      force = force_name
+      force = force_name,
+      direction = turret_data.direction
     })
 
     if turret and turret.valid then
+      if turret_data.direction and turret.supports_direction then
+        turret.direction = turret_data.direction
+      end
       if turret_data.ammo and turret.insert then
         turret.insert({name = "piercing-rounds-magazine", count = turret_data.ammo})
       end
-      if turret_data.fluid and turret.insert_fluid then
+      local pipe_position
+      if turret.name == "flamethrower-turret" then
+        local fuel_name = turret_data.fuel_name or "light-oil"
+        local connection_index = turret_data.pipe_connection_index or 1
+        local pipe_connections = turret.fluidbox and turret.fluidbox.get_pipe_connections and turret.fluidbox.get_pipe_connections(1) or nil
+
+        if pipe_connections then
+          for pipe_index = connection_index, #pipe_connections do
+            local connection = pipe_connections[pipe_index]
+            local pipe_target = connection and connection.target_position or nil
+            if pipe_target then
+              local pipe = surface.create_entity({
+                name = "infinity-pipe",
+                position = pipe_target,
+                force = force_name,
+                infinity_settings = {
+                  name = fuel_name,
+                  percentage = 1,
+                  mode = "at-least"
+                }
+              })
+
+              if pipe and pipe.valid then
+                pipe.destructible = false
+                pipe.minable = false
+                if pipe.set_infinity_pipe_filter then
+                  pipe.set_infinity_pipe_filter({
+                    name = fuel_name,
+                    percentage = 1,
+                    mode = "at-least"
+                  })
+                end
+                pipe_position = serialize_position(pipe.position)
+                break
+              end
+            end
+          end
+        end
+
+        if not pipe_position and turret.insert_fluid then
+          turret.insert_fluid({
+            name = fuel_name,
+            amount = 400
+          })
+        end
+      elseif turret_data.fluid and turret.insert_fluid then
         turret.insert_fluid(turret_data.fluid)
       end
       turret_positions[#turret_positions + 1] = {
         name = turret.name,
-        position = serialize_position(turret.position)
+        position = serialize_position(turret.position),
+        direction = turret.direction,
+        fuel_name = turret_data.fuel_name,
+        pipe_position = pipe_position
       }
     end
   end
@@ -4051,22 +4229,71 @@ local function build_turrets(surface, force_name, scenario)
   return turret_positions
 end
 
-local function spawn_debug_group(surface, scenario)
+function arena_runtime.build_structures(surface, force_name, scenario)
+  local structure_positions = {}
+
+  for index = 1, #(scenario.structures or {}) do
+    local structure_data = scenario.structures[index]
+    local structure = surface.create_entity({
+      name = structure_data.name,
+      position = structure_data.position,
+      force = force_name,
+      direction = structure_data.direction
+    })
+
+    if structure and structure.valid then
+      structure_positions[#structure_positions + 1] = {
+        name = structure.name,
+        position = serialize_position(structure.position)
+      }
+    end
+  end
+
+  return structure_positions
+end
+
+function arena_runtime.build_wave_manifest(scenario)
+  local waves = {}
+  local scenario_waves = scenario.waves or {{
+    delay = 0,
+    spawn_position = scenario.spawn_position,
+    target_position = scenario.target_position,
+    units = scenario.units
+  }}
+
+  for index = 1, #scenario_waves do
+    local wave = scenario_waves[index]
+    waves[#waves + 1] = {
+      index = index,
+      delay = wave.delay or 0,
+      spawn_position = serialize_position(wave.spawn_position),
+      target_position = serialize_position(wave.target_position),
+      units = wave.units
+    }
+  end
+
+  return waves
+end
+
+function arena_runtime.spawn_debug_group(surface, scenario, wave_data, wave_index)
+  local spawn_position = wave_data and wave_data.spawn_position or scenario.spawn_position
+  local target_position = wave_data and wave_data.target_position or scenario.target_position
+  local units = wave_data and wave_data.units or scenario.units
   local group = surface.create_unit_group({
-    position = scenario.spawn_position,
+    position = spawn_position,
     force = "enemy"
   })
 
   local unit_index = 0
-  for stack_index = 1, #scenario.units do
-    local unit_stack = scenario.units[stack_index]
+  for stack_index = 1, #units do
+    local unit_stack = units[stack_index]
     for _ = 1, unit_stack.count do
       unit_index = unit_index + 1
       local offset = ((unit_index - 1) % 4) * 0.6
       local row = math.floor((unit_index - 1) / 4) * 0.6
       local position = {
-        x = scenario.spawn_position.x - row,
-        y = scenario.spawn_position.y - 1 + offset
+        x = spawn_position.x - row,
+        y = spawn_position.y - 1 + offset
       }
 
       local unit = surface.create_entity({
@@ -4083,22 +4310,36 @@ local function spawn_debug_group(surface, scenario)
 
   group.set_command({
     type = defines.command.attack_area,
-    destination = scenario.target_position,
+    destination = target_position,
     radius = ATTACK_RADIUS,
     distraction = defines.distraction.by_enemy
   })
   group.start_moving()
 
+  local record = storage.group_ai[group.unique_id] or register_group(group, "main", nil, scenario.name)
+  if record then
+    record.state = "tracking"
+    record_debug_event("arena_wave_spawned", record, {
+      reason = wave_index and ("wave-" .. wave_index) or "wave",
+      scenario = scenario.name,
+      target_position = target_position
+    })
+  end
+
   return group
 end
 
-local function build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions)
+function arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions, structure_positions)
   storage.debug.arena = {
     scenario = scenario.name,
     surface_name = surface.name,
     spawn_position = serialize_position(scenario.spawn_position),
     wall_anchor_positions = wall_anchor_positions,
     turret_positions = turret_positions,
+    structure_positions = structure_positions,
+    waves = arena_runtime.build_wave_manifest(scenario),
+    pending_waves = {},
+    spawned_wave_count = 0,
     open_breach_positions = serialize_positions(scenario.open_breach_positions),
     expected_behavior = scenario.expected_behavior,
     expected_event_sequence = scenario.expected_event_sequence
@@ -4107,7 +4348,38 @@ local function build_debug_arena_manifest(surface, scenario, wall_anchor_positio
   write_arena_manifest()
 end
 
-local function seed_reuse_site(surface, scenario)
+process_debug_arena_waves = function()
+  local arena = storage.debug.arena
+  if not (arena and arena.pending_waves and #arena.pending_waves > 0) then
+    return
+  end
+
+  local surface = game.surfaces[arena.surface_name]
+  if not surface then
+    return
+  end
+
+  local index = 1
+  while index <= #arena.pending_waves do
+    local wave = arena.pending_waves[index]
+    if wave.spawn_tick <= game.tick then
+      arena_runtime.spawn_debug_group(surface, DEBUG_SCENARIOS[arena.scenario], wave, wave.index)
+      arena.spawned_wave_count = (arena.spawned_wave_count or 0) + 1
+
+      for _, site in pairs(storage.siege_sites) do
+        if site.surface_index == surface.index then
+          site.wave_count = arena.spawned_wave_count
+        end
+      end
+
+      table.remove(arena.pending_waves, index)
+    else
+      index = index + 1
+    end
+  end
+end
+
+function arena_runtime.seed_reuse_site(surface, scenario)
   if not scenario.reuse_site then
     return
   end
@@ -4120,6 +4392,7 @@ local function seed_reuse_site(surface, scenario)
     surface_index = surface.index,
     defense_force_name = "player",
     target_position = copy_position(breach_center),
+    approach_side = "west",
     rally_position = {x = breach_center.x - BREACH_ENTRY_DISTANCE, y = breach_center.y},
     support_position = {x = breach_center.x - (BREACH_ENTRY_DISTANCE + 3), y = breach_center.y},
     breach_positions = breach_positions,
@@ -4132,6 +4405,7 @@ local function seed_reuse_site(surface, scenario)
     assault_targets = {},
     assault_group_ids = {},
     reserve_group_ids = {},
+    wave_count = 0,
     expires_tick = game.tick + SIEGE_SITE_TTL
   }
 
@@ -4141,6 +4415,7 @@ local function seed_reuse_site(surface, scenario)
     site.inside_rally_position = copy_position(scenario.target_position)
     site.exploit_position = copy_position(scenario.target_position)
   end
+  site.wave_count = 0
   collect_local_assault_targets(surface, site)
 end
 
@@ -4162,9 +4437,9 @@ local function command_debug_arena(command)
     return
   end
 
-  local surface = get_or_create_debug_surface()
+  local surface = arena_runtime.get_or_create_debug_surface()
   purge_surface_runtime_state(surface.index)
-  clear_debug_surface(surface)
+  arena_runtime.clear_debug_surface(surface)
   clear_debug_runtime()
   storage.debug.arena = nil
 
@@ -4172,19 +4447,47 @@ local function command_debug_arena(command)
     set_debug_enabled(command.player_index, true)
   end
 
-  local wall_anchor_positions = build_wall_segments(surface, "player", scenario)
-  local turret_positions = build_turrets(surface, "player", scenario)
-  seed_reuse_site(surface, scenario)
-  build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions)
-  local group = spawn_debug_group(surface, scenario)
-  local record = storage.group_ai[group.unique_id] or register_group(group, "main", nil, scenario.name)
-  if record then
-    record.state = "tracking"
+  local wall_anchor_positions = arena_runtime.build_wall_segments(surface, "player", scenario)
+  local turret_positions = arena_runtime.build_turrets(surface, "player", scenario)
+  local structure_positions = arena_runtime.build_structures(surface, "player", scenario)
+  arena_runtime.seed_reuse_site(surface, scenario)
+  arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions, structure_positions)
+
+  local scenario_waves = scenario.waves or {{
+    delay = 0,
+    spawn_position = scenario.spawn_position,
+    target_position = scenario.target_position,
+    units = scenario.units
+  }}
+
+  if #scenario_waves > 0 then
+    storage.debug.arena.pending_waves = {}
+    for wave_index = 1, #scenario_waves do
+      local wave = scenario_waves[wave_index]
+      if (wave.delay or 0) <= 0 then
+        arena_runtime.spawn_debug_group(surface, scenario, wave, wave_index)
+        storage.debug.arena.spawned_wave_count = storage.debug.arena.spawned_wave_count + 1
+      else
+        storage.debug.arena.pending_waves[#storage.debug.arena.pending_waves + 1] = {
+          index = wave_index,
+          spawn_tick = game.tick + (wave.delay or 0),
+          spawn_position = copy_position(wave.spawn_position),
+          target_position = copy_position(wave.target_position),
+          units = wave.units
+        }
+      end
+    end
+
+    for _, site in pairs(storage.siege_sites) do
+      if site.surface_index == surface.index then
+        site.wave_count = storage.debug.arena.spawned_wave_count
+      end
+    end
   end
 
   if player and player.valid then
     player.teleport(scenario.observe_position, surface)
-    chart_debug_surface(surface, player)
+    arena_runtime.chart_debug_surface(surface, player)
     player.print({"advanced-biter-tactics.debug-arena-created",
       scenario.name,
       surface.name,
@@ -4193,6 +4496,7 @@ local function command_debug_arena(command)
       format_number(scenario.target_position.x),
       format_number(scenario.target_position.y)
     })
+    player.print({"advanced-biter-tactics.debug-arena-expected", scenario.expected_behavior})
   else
     game.print({"advanced-biter-tactics.debug-arena-created",
       scenario.name,
@@ -4202,6 +4506,7 @@ local function command_debug_arena(command)
       format_number(scenario.target_position.x),
       format_number(scenario.target_position.y)
     })
+    game.print({"advanced-biter-tactics.debug-arena-expected", scenario.expected_behavior})
   end
 
   write_manual_dump("arena-created")

@@ -27,9 +27,9 @@ Debugging / test arena:
 - Debug output is written under `script-output/advanced-biter-tactics/` as `events.jsonl`, `latest-snapshot.json`, and `arena-manifest.json`.
 - `events.jsonl` is the primary AI-readable event stream; `latest-snapshot.json` captures current group and siege-site state; `arena-manifest.json` records scenario coordinates and expected event flow.
 - `spitter-siege` is meant to show pure ranged breach widening from standoff range; `mixed-breach-siege` adds melee units that should hold position until the breach is at least 2 to 3 wall segments wide.
-- `mixed-turret-breach` focuses on post-breach melee splitting across multiple interior gun turrets.
-- `flame-turret-breach` focuses on flamethrower-turret priority, wide melee approach lanes, and keeping spitters out of flame danger.
-- `breach-reuse` seeds an already open breach so a fresh group should use it instead of picking a new wall contact.
+- `mixed-turret-breach` focuses on a same-side west standoff, widening the breach first, and only then splitting melee attackers across multiple interior gun turrets.
+- `flame-turret-breach` focuses on west-facing flamethrower turrets with dedicated infinity-pipe fuel, wide melee approach lanes, and keeping spitters out of flame danger.
+- `breach-reuse` now runs as a two-wave scenario with an interior objective so the second wave should visibly reuse the already open breach instead of picking a new wall contact.
 
 VS Code:
 
