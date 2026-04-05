@@ -83,6 +83,12 @@ local DEBUG_EVENT_NAMES = {
 
 local count_open_breach_segments
 local get_site_for_record
+local process_tracked_groups
+local command_debug
+local command_debug_arena
+local on_group_created
+local on_group_finished
+local on_ai_command_completed
 
 local DEBUG_SCENARIOS = {
   ["wall-open"] = {
@@ -3523,6 +3529,7 @@ local function process_group_record(record_id)
   plan_group_action(record, group)
 end
 
+do
 local function draw_debug_overlay()
   clear_debug_overlay()
 
@@ -3680,7 +3687,7 @@ local function draw_debug_overlay()
   end
 end
 
-local function process_tracked_groups()
+process_tracked_groups = function()
   ensure_globals()
   prune_siege_sites()
 
@@ -3816,7 +3823,7 @@ local function write_manual_dump(reason)
   write_arena_manifest()
 end
 
-local function command_debug(command)
+command_debug = function(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -3902,6 +3909,7 @@ local function command_debug(command)
   end
 end
 
+do
 local function get_or_create_debug_surface()
   local surface = game.surfaces[DEBUG_ARENA_SURFACE_NAME]
   if surface and surface.valid then
@@ -4142,7 +4150,7 @@ local function seed_reuse_site(surface, scenario)
   collect_local_assault_targets(surface, site)
 end
 
-local function command_debug_arena(command)
+command_debug_arena = function(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -4205,7 +4213,7 @@ local function command_debug_arena(command)
   write_manual_dump("arena-created")
 end
 
-local function on_group_created(event)
+on_group_created = function(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -4214,7 +4222,7 @@ local function on_group_created(event)
   register_group(event.group, "main", nil, scenario)
 end
 
-local function on_group_finished(event)
+on_group_finished = function(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -4223,12 +4231,14 @@ local function on_group_finished(event)
   register_group(event.group, "main", nil, scenario)
 end
 
-local function on_ai_command_completed(event)
+on_ai_command_completed = function(event)
   ensure_globals()
   local record = storage.group_ai[event.unit_number]
   if record then
     mark_command_complete(record, event.result, event.tick or game.tick)
   end
+end
+end
 end
 
 commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
