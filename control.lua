@@ -107,7 +107,6 @@ local parse_command_parameter
 local write_manual_dump
 local set_debug_enabled
 local clear_debug_runtime
-local command_debug
 local runtime_ext = {}
 local DEBUG_SCENARIOS = {
   ["wall-open"] = {
@@ -548,6 +547,19 @@ local function serialize_bounds(bounds)
   }
 end
 
+local function serialize_area_from_center(position, radius)
+  return serialize_bounds({
+    left_top = {
+      x = position.x - radius,
+      y = position.y - radius
+    },
+    right_bottom = {
+      x = position.x + radius,
+      y = position.y + radius
+    }
+  })
+end
+
 local function average_positions(positions)
   if not positions or #positions == 0 then
     return nil
@@ -865,6 +877,22 @@ local function serialize_record(record)
   }
 end
 
+local function serialize_visible_entity(entity)
+  return {
+    name = entity.name,
+    type = entity.type,
+    force = entity.force and entity.force.name or nil,
+    unit_number = entity.unit_number,
+    position = serialize_position(entity.position),
+    health = entity.health,
+    max_health = entity.prototype and entity.prototype.max_health or nil,
+    direction = entity.direction,
+    status = entity.status,
+    active = entity.active,
+    destructible = entity.destructible
+  }
+end
+
 local function write_latest_snapshot(reason)
   ensure_globals()
 
@@ -913,6 +941,53 @@ local function write_arena_manifest()
   if storage.debug.arena then
     json_write(DEBUG_FILES.arena_manifest, storage.debug.arena, false)
   end
+end
+
+local function get_recent_scenario_events(scenario_name)
+  ensure_globals()
+
+  local events = {}
+  for index = 1, #storage.debug.recent_events do
+    local event = storage.debug.recent_events[index]
+    if scenario_name == nil or event.scenario == scenario_name then
+      events[#events + 1] = event
+    end
+  end
+
+  return events
+end
+
+local function event_sequence_matches(events, expected_sequence)
+  local event_index = 1
+  local matched = {}
+  local missing = {}
+
+  for expected_index = 1, #expected_sequence do
+    local expected_event = expected_sequence[expected_index]
+    while event_index <= #events and events[event_index].event ~= expected_event do
+      event_index = event_index + 1
+    end
+
+    if event_index > #events then
+      missing[#missing + 1] = expected_event
+    else
+      matched[#matched + 1] = expected_event
+      event_index = event_index + 1
+    end
+  end
+
+  return #missing == 0, matched, missing
+end
+
+local function make_bridge_assertion(name, assertion_type, passed, expected, actual, evidence)
+  return {
+    name = name,
+    type = assertion_type,
+    passed = passed,
+    expected = expected,
+    actual = actual,
+    evidence = evidence or {}
+  }
 end
 
 local function record_debug_event(event_name, record, extra)
@@ -4134,12 +4209,15 @@ local function process_group_record(record_id)
   record.last_position = copy_position(group.position)
   record.surface_name = group.surface.name
 
+  local is_debug_arena_group = record.scenario ~= nil and group.surface.name == DEBUG_ARENA_SURFACE_NAME
+
   if record.role ~= "support"
     and record.role ~= "assault"
     and record.role ~= "reserve"
     and group.is_unit_group
     and group.state == defines.group_state.gathering
-    and record.state == "tracking" then
+    and record.state == "tracking"
+    and not is_debug_arena_group then
     return
   end
 
@@ -4502,7 +4580,84 @@ write_manual_dump = function(reason)
   write_arena_manifest()
 end
 
-command_debug = function(command)
+local function setup_agent_bridge_scenario(scenario_name, player_index, options)
+  ensure_globals()
+
+  local scenario = DEBUG_SCENARIOS[scenario_name]
+  if not scenario then
+    error("unknown advanced-biter-tactics debug arena scenario: " .. tostring(scenario_name))
+  end
+
+  local player = player_index and game.get_player(player_index) or nil
+  local surface = arena_runtime.get_or_create_debug_surface()
+  purge_surface_runtime_state(surface.index)
+  arena_runtime.clear_debug_surface(surface)
+  clear_debug_runtime()
+  storage.debug.arena = nil
+  set_debug_enabled(0, true)
+
+  if player_index then
+    set_debug_enabled(player_index, true)
+  end
+
+  local wall_anchor_positions = arena_runtime.build_wall_segments(surface, "player", scenario)
+  local turret_positions = arena_runtime.build_turrets(surface, "player", scenario)
+  local structure_positions = arena_runtime.build_structures(surface, "player", scenario)
+  arena_runtime.seed_reuse_site(surface, scenario)
+  arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions, structure_positions)
+
+  local scenario_waves = scenario.waves or {{
+    delay = 0,
+    spawn_position = scenario.spawn_position,
+    target_position = scenario.target_position,
+    units = scenario.units
+  }}
+
+  if #scenario_waves > 0 then
+    storage.debug.arena.pending_waves = {}
+    for wave_index = 1, #scenario_waves do
+      local wave = scenario_waves[wave_index]
+      if (wave.delay or 0) <= 0 then
+        arena_runtime.spawn_debug_group(surface, scenario, wave, wave_index)
+        storage.debug.arena.spawned_wave_count = storage.debug.arena.spawned_wave_count + 1
+      else
+        storage.debug.arena.pending_waves[#storage.debug.arena.pending_waves + 1] = {
+          index = wave_index,
+          spawn_tick = game.tick + (wave.delay or 0),
+          spawn_position = copy_position(wave.spawn_position),
+          target_position = copy_position(wave.target_position),
+          units = wave.units
+        }
+      end
+    end
+
+    for _, site in pairs(storage.siege_sites) do
+      if site.surface_index == surface.index then
+        site.wave_count = storage.debug.arena.spawned_wave_count
+      end
+    end
+  end
+
+  if player and player.valid then
+    player.teleport(scenario.observe_position, surface)
+    arena_runtime.chart_debug_surface(surface, player)
+  end
+
+  write_manual_dump(options and options.reason or "agent-bridge-setup")
+
+  return {
+    scenario_name = scenario.name,
+    surface_name = surface.name,
+    observe_position = serialize_position(scenario.observe_position),
+    spawn_position = serialize_position(scenario.spawn_position),
+    target_position = serialize_position(scenario.target_position),
+    expected_support_mode = scenario.expected_support_mode,
+    expected_reuse_wave_count = scenario.expected_reuse_wave_count,
+    expected_event_sequence = scenario.expected_event_sequence
+  }
+end
+
+local function command_debug(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -4587,6 +4742,9 @@ command_debug = function(command)
     game.print({"advanced-biter-tactics.debug-help"})
   end
 end
+
+commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
+script.on_nth_tick(PROCESS_INTERVAL, process_tracked_groups)
 end
 
 do
@@ -4873,14 +5031,6 @@ function arena_runtime.spawn_debug_group(surface, scenario, wave_data, wave_inde
     end
   end
 
-  group.set_command({
-    type = defines.command.attack_area,
-    destination = target_position,
-    radius = ATTACK_RADIUS,
-    distraction = defines.distraction.by_enemy
-  })
-  group.start_moving()
-
   local record = storage.group_ai[group.unique_id] or register_group(group, "main", nil, scenario.name)
   if record then
     record.state = "tracking"
@@ -5098,8 +5248,10 @@ local function command_debug_arena(command)
 end
 
 commands.add_command("abt-debug-arena", {"advanced-biter-tactics.command-help-arena"}, command_debug_arena)
+end
 
-local function on_group_created(event)
+do
+runtime_ext.on_group_created = function(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -5109,7 +5261,7 @@ local function on_group_created(event)
   register_group(event.group, existing and existing.role or "main", existing and existing.parent_id or nil, scenario)
 end
 
-local function on_group_finished(event)
+runtime_ext.on_group_finished = function(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -5119,7 +5271,7 @@ local function on_group_finished(event)
   register_group(event.group, existing and existing.role or "main", existing and existing.parent_id or nil, scenario)
 end
 
-local function on_ai_command_completed(event)
+runtime_ext.on_ai_command_completed = function(event)
   ensure_globals()
   local record = storage.group_ai[event.unit_number]
   if record then
@@ -5168,14 +5320,11 @@ runtime_ext.on_entity_damaged = function(event)
   end
 end
 
-script.on_event(defines.events.on_unit_group_created, on_group_created)
-script.on_event(defines.events.on_unit_group_finished_gathering, on_group_finished)
-script.on_event(defines.events.on_ai_command_completed, on_ai_command_completed)
+script.on_event(defines.events.on_unit_group_created, runtime_ext.on_group_created)
+script.on_event(defines.events.on_unit_group_finished_gathering, runtime_ext.on_group_finished)
+script.on_event(defines.events.on_ai_command_completed, runtime_ext.on_ai_command_completed)
 script.on_event(defines.events.on_entity_damaged, runtime_ext.on_entity_damaged)
-script.on_nth_tick(PROCESS_INTERVAL, process_tracked_groups)
 end
-
-commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
 
 script.on_init(repair_runtime_state)
 script.on_configuration_changed(repair_runtime_state)
