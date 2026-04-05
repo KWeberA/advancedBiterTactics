@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Factorio: Start Local Test Instance",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${config:advancedBiterTactics.factorioExe}",
+      "args": [
+        "--config",
+        "${workspaceFolder}\\factorio-test-config.ini",
+        "--mod-directory",
+        "${workspaceFolder}\\.factorio-test\\mods"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "preLaunchTask": "Factorio: Sync Test Mod Files"
+    }
+  ]
+}

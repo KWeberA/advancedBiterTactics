@@ -17,7 +17,7 @@ Implementation notes:
 
 - Runtime-only logic lives in `control.lua`.
 - No startup settings are required for V1.
-- The repository currently has no automated Factorio harness, so validation depends on static review plus manual in-game smoke tests with Factorio 2.0.
+- The repository now includes a VS Code startup smoke test for reaching `InGame`; deeper gameplay validation still depends on static review plus targeted in-game smoke tests with Factorio 2.0.
 
 Debugging / test arena:
 
@@ -30,3 +30,10 @@ Debugging / test arena:
 - `mixed-turret-breach` focuses on post-breach melee splitting across multiple interior gun turrets.
 - `flame-turret-breach` focuses on flamethrower-turret priority, wide melee approach lanes, and keeping spitters out of flame danger.
 - `breach-reuse` seeds an already open breach so a fresh group should use it instead of picking a new wall contact.
+
+VS Code:
+
+- Copy `.vscode/settings.example.json` to a local `.vscode/settings.json` or set `advancedBiterTactics.factorioExe` in your personal VS Code user settings.
+- Use `Run and Debug` with `Factorio: Start Local Test Instance` to start a local test instance wired to `.factorio-test/`.
+- The launch entry uses VS Code's Windows `cppvsdbg` debugger type, so VS Code may ask to install the Microsoft C/C++ debugger extension the first time.
+- Use `Terminal -> Run Task -> Factorio: Run Startup Smoke Test` to run the non-interactive startup smoke test that waits for Factorio to reach `InGame` and then shuts it down again.

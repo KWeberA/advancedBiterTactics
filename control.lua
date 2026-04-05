@@ -38,12 +38,13 @@ local SUPPORT_FOLLOW_MIN_DISTANCE = 2
 local FLAME_LANE_COUNT = 3
 local FLAME_LANE_SPREAD = 4
 local FLAME_HAZARD_RADIUS = 2.5
-local FIRE_SCAN_RADIUS = 18
 
 local DEBUG_DIR = MOD_NAME
-local DEBUG_EVENTS_FILE = DEBUG_DIR .. "/events.jsonl"
-local DEBUG_SNAPSHOT_FILE = DEBUG_DIR .. "/latest-snapshot.json"
-local DEBUG_ARENA_MANIFEST_FILE = DEBUG_DIR .. "/arena-manifest.json"
+local DEBUG_FILES = {
+  events = DEBUG_DIR .. "/events.jsonl",
+  snapshot = DEBUG_DIR .. "/latest-snapshot.json",
+  arena_manifest = DEBUG_DIR .. "/arena-manifest.json"
+}
 local DEBUG_RECENT_EVENT_LIMIT = 32
 local DEBUG_STATUS_EVENT_LIMIT = 10
 local DEBUG_OVERLAY_CANDIDATE_LIMIT = 8
@@ -83,13 +84,6 @@ local DEBUG_EVENT_NAMES = {
 
 local count_open_breach_segments
 local get_site_for_record
-local process_tracked_groups
-local command_debug
-local command_debug_arena
-local on_group_created
-local on_group_finished
-local on_ai_command_completed
-
 local DEBUG_SCENARIOS = {
   ["wall-open"] = {
     name = "wall-open",
@@ -808,7 +802,7 @@ local function write_latest_snapshot(reason)
     recent_events[index] = storage.debug.recent_events[index]
   end
 
-  json_write(DEBUG_SNAPSHOT_FILE, {
+  json_write(DEBUG_FILES.snapshot, {
     tick = game.tick,
     reason = reason,
     debug_enabled_players = get_debug_player_indices(),
@@ -824,7 +818,7 @@ end
 
 local function write_arena_manifest()
   if storage.debug.arena then
-    json_write(DEBUG_ARENA_MANIFEST_FILE, storage.debug.arena, false)
+    json_write(DEBUG_FILES.arena_manifest, storage.debug.arena, false)
   end
 end
 
@@ -866,7 +860,7 @@ local function record_debug_event(event_name, record, extra)
   trim_recent_events()
 
   if is_debug_capture_enabled() then
-    append_jsonl(DEBUG_EVENTS_FILE, payload)
+    append_jsonl(DEBUG_FILES.events, payload)
   end
 end
 
@@ -3687,7 +3681,7 @@ local function draw_debug_overlay()
   end
 end
 
-process_tracked_groups = function()
+local function process_tracked_groups()
   ensure_globals()
   prune_siege_sites()
 
@@ -3823,7 +3817,7 @@ local function write_manual_dump(reason)
   write_arena_manifest()
 end
 
-command_debug = function(command)
+local function command_debug(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -3885,9 +3879,9 @@ command_debug = function(command)
   if mode == "dump" then
     write_manual_dump("manual-dump")
     if player then
-      player.print({"advanced-biter-tactics.debug-dumped", DEBUG_SNAPSHOT_FILE, DEBUG_EVENTS_FILE})
+      player.print({"advanced-biter-tactics.debug-dumped", DEBUG_FILES.snapshot, DEBUG_FILES.events})
     else
-      game.print({"advanced-biter-tactics.debug-dumped", DEBUG_SNAPSHOT_FILE, DEBUG_EVENTS_FILE})
+      game.print({"advanced-biter-tactics.debug-dumped", DEBUG_FILES.snapshot, DEBUG_FILES.events})
     end
     return
   end
@@ -4150,7 +4144,7 @@ local function seed_reuse_site(surface, scenario)
   collect_local_assault_targets(surface, site)
 end
 
-command_debug_arena = function(command)
+local function command_debug_arena(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -4213,7 +4207,7 @@ command_debug_arena = function(command)
   write_manual_dump("arena-created")
 end
 
-on_group_created = function(event)
+local function on_group_created(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -4222,7 +4216,7 @@ on_group_created = function(event)
   register_group(event.group, "main", nil, scenario)
 end
 
-on_group_finished = function(event)
+local function on_group_finished(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -4231,22 +4225,23 @@ on_group_finished = function(event)
   register_group(event.group, "main", nil, scenario)
 end
 
-on_ai_command_completed = function(event)
+local function on_ai_command_completed(event)
   ensure_globals()
   local record = storage.group_ai[event.unit_number]
   if record then
     mark_command_complete(record, event.result, event.tick or game.tick)
   end
 end
-end
-end
 
 commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
 commands.add_command("abt-debug-arena", {"advanced-biter-tactics.command-help-arena"}, command_debug_arena)
 
-script.on_init(repair_runtime_state)
-script.on_configuration_changed(repair_runtime_state)
 script.on_event(defines.events.on_unit_group_created, on_group_created)
 script.on_event(defines.events.on_unit_group_finished_gathering, on_group_finished)
 script.on_event(defines.events.on_ai_command_completed, on_ai_command_completed)
 script.on_nth_tick(PROCESS_INTERVAL, process_tracked_groups)
+end
+end
+
+script.on_init(repair_runtime_state)
+script.on_configuration_changed(repair_runtime_state)
