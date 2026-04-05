@@ -4,9 +4,9 @@ param(
 
   [string]$FactorioExe,
 
-  [int]$BenchmarkTicks = 720,
+  [int]$BenchmarkTicks = 1800,
 
-  [string]$CaptureTicks = "0,120,240,480,720",
+  [string]$CaptureTicks = "0,60,120,180,240,300,360,480,600,720,900,1200,1500,1800",
 
   [string]$RunTag
 )
