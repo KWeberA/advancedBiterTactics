@@ -3,17 +3,18 @@
   "configurations": [
     {
       "name": "Factorio: Start Local Test Instance",
-      "type": "cppvsdbg",
+      "type": "node-terminal",
       "request": "launch",
-      "program": "${config:advancedBiterTactics.factorioExe}",
-      "args": [
-        "--config",
-        "${workspaceFolder}\\factorio-test-config.ini",
-        "--mod-directory",
-        "${workspaceFolder}\\.factorio-test\\mods"
-      ],
+      "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .vscode/factorio-vscode.ps1 -Action start -FactorioExe \"${config:advancedBiterTactics.factorioExe}\"",
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
+      "preLaunchTask": "Factorio: Sync Test Mod Files"
+    },
+    {
+      "name": "Factorio: Run Startup Smoke Test",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .vscode/factorio-vscode.ps1 -Action smoke -FactorioExe \"${config:advancedBiterTactics.factorioExe}\"",
+      "cwd": "${workspaceFolder}",
       "preLaunchTask": "Factorio: Sync Test Mod Files"
     }
   ]

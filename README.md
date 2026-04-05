@@ -33,7 +33,9 @@ Debugging / test arena:
 
 VS Code:
 
-- Copy `.vscode/settings.example.json` to a local `.vscode/settings.json` or set `advancedBiterTactics.factorioExe` in your personal VS Code user settings.
+- This repo workflow currently targets Windows because it uses `powershell.exe` and a local `factorio.exe` path.
+- Copy `.vscode/settings.example.json` to a local `.vscode/settings.json` or set `advancedBiterTactics.factorioExe` in your personal VS Code user settings. The local `.vscode/settings.json` file is gitignored.
 - Use `Run and Debug` with `Factorio: Start Local Test Instance` to start a local test instance wired to `.factorio-test/`.
-- The launch entry uses VS Code's Windows `cppvsdbg` debugger type, so VS Code may ask to install the Microsoft C/C++ debugger extension the first time.
-- Use `Terminal -> Run Task -> Factorio: Run Startup Smoke Test` to run the non-interactive startup smoke test that waits for Factorio to reach `InGame` and then shuts it down again.
+- Use `Run and Debug` with `Factorio: Run Startup Smoke Test` or `Terminal -> Run Task -> Factorio: Run Startup Smoke Test` to run the non-interactive startup smoke test that waits for Factorio to reach `InGame` and then shuts it down again.
+- `Factorio: Sync Test Mod Files` runs automatically before both Run-and-Debug entries and before the startup smoke-test task, so you normally do not need to run it by hand.
+- The VS Code helper logic lives in `.vscode/factorio-vscode.ps1`, so the workflow does not depend on long inline shell commands or on your default integrated terminal shell.

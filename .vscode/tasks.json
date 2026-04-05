@@ -3,28 +3,34 @@
   "tasks": [
     {
       "label": "Factorio: Sync Test Mod Files",
-      "type": "shell",
-      "command": "powershell",
+      "type": "process",
+      "command": "powershell.exe",
       "args": [
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
-        "-Command",
-        "$ErrorActionPreference='Stop'; $repo='${workspaceFolder}'; $config=Join-Path $repo 'factorio-test-config.ini'; $configTemplate=Join-Path $repo 'factorio-test-config.example.ini'; $modInfo=Get-Content -Path (Join-Path $repo 'info.json') -Raw | ConvertFrom-Json; $modName=$modInfo.name; $modVersion=$modInfo.version; $userData=(Join-Path $repo '.factorio-test\\user-data') -replace '\\\\','/'; $modRoot=Join-Path $repo '.factorio-test\\mods'; $modDir=Join-Path $modRoot ($modName + '_' + $modVersion); New-Item -ItemType Directory -Force -Path $modRoot | Out-Null; New-Item -ItemType Directory -Force -Path $userData | Out-Null; if (Test-Path $modDir) { $resolvedModDir=[System.IO.Path]::GetFullPath($modDir); $resolvedModRoot=[System.IO.Path]::GetFullPath($modRoot); if (-not $resolvedModDir.StartsWith($resolvedModRoot, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Refusing to clean unexpected test mod directory.' }; Remove-Item -LiteralPath $modDir -Recurse -Force }; New-Item -ItemType Directory -Force -Path $modDir | Out-Null; if (-not (Test-Path $config)) { $configContent=(Get-Content -Path $configTemplate -Raw).Replace('<ABSOLUTE_WRITE_DATA_PATH>', $userData); Set-Content -Path $config -Value $configContent -Encoding Ascii }; Get-ChildItem -Path $repo -File | Where-Object { $_.Name -eq 'info.json' -or $_.Extension -eq '.lua' } | ForEach-Object { Copy-Item $_.FullName (Join-Path $modDir $_.Name) -Force }; foreach ($optionalDir in @('locale','graphics','sound','prototypes','migrations')) { $sourceDir=Join-Path $repo $optionalDir; if (Test-Path $sourceDir) { Copy-Item $sourceDir (Join-Path $modDir $optionalDir) -Recurse -Force } }; $modList=@{ mods=@(@{ name='base'; enabled=$true }, @{ name=$modName; enabled=$true }) } | ConvertTo-Json -Depth 4; Set-Content -Path (Join-Path $modRoot 'mod-list.json') -Value $modList -Encoding Ascii"
+        "-File",
+        "${workspaceFolder}\\.vscode\\factorio-vscode.ps1",
+        "-Action",
+        "sync"
       ],
       "problemMatcher": []
     },
     {
       "label": "Factorio: Run Startup Smoke Test",
-      "type": "shell",
+      "type": "process",
       "dependsOn": "Factorio: Sync Test Mod Files",
-      "command": "powershell",
+      "command": "powershell.exe",
       "args": [
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
-        "-Command",
-        "$ErrorActionPreference='Stop'; $factorio='${config:advancedBiterTactics.factorioExe}'; if (-not (Test-Path $factorio)) { throw 'Set advancedBiterTactics.factorioExe in .vscode/settings.json or in your user settings.' }; $repo='${workspaceFolder}'; $config=Join-Path $repo 'factorio-test-config.ini'; $mods=Join-Path $repo '.factorio-test\\mods'; $log=Join-Path $repo '.factorio-test\\user-data\\factorio-current.log'; if (Test-Path $log) { Remove-Item -LiteralPath $log -Force }; $args=@('--config', $config, '--mod-directory', $mods, '--disable-audio', '--start-server-load-scenario', 'base/freeplay'); $run=$null; try { $run=Start-Process -FilePath $factorio -ArgumentList $args -PassThru; $timeout=[TimeSpan]::FromSeconds(30); $deadline=[DateTime]::UtcNow + $timeout; while ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 250; if (Test-Path $log) { $logText=Get-Content -Path $log -Raw; if ($logText -match 'Error ') { throw 'Factorio startup smoke test logged an error.' }; if ($logText -match 'changing state from\\(CreatingGame\\) to\\(InGame\\)') { return } }; if ($run.HasExited) { throw ('Factorio exited before reaching InGame with exit code ' + $run.ExitCode) } }; throw 'Factorio startup smoke test timed out before reaching InGame.' } finally { if ($run -and -not $run.HasExited) { Stop-Process -Id $run.Id -Force } }"
+        "-File",
+        "${workspaceFolder}\\.vscode\\factorio-vscode.ps1",
+        "-Action",
+        "smoke",
+        "-FactorioExe",
+        "${config:advancedBiterTactics.factorioExe}"
       ],
       "problemMatcher": []
     }
