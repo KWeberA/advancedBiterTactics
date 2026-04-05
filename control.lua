@@ -108,6 +108,7 @@ local write_manual_dump
 local set_debug_enabled
 local clear_debug_runtime
 local runtime_ext = {}
+local arena_runtime
 local DEBUG_SCENARIOS = {
   ["wall-open"] = {
     name = "wall-open",
@@ -547,7 +548,7 @@ local function serialize_bounds(bounds)
   }
 end
 
-local function serialize_area_from_center(position, radius)
+runtime_ext.serialize_area_from_center = function(position, radius)
   return serialize_bounds({
     left_top = {
       x = position.x - radius,
@@ -877,7 +878,7 @@ local function serialize_record(record)
   }
 end
 
-local function serialize_visible_entity(entity)
+runtime_ext.serialize_visible_entity = function(entity)
   return {
     name = entity.name,
     type = entity.type,
@@ -885,7 +886,6 @@ local function serialize_visible_entity(entity)
     unit_number = entity.unit_number,
     position = serialize_position(entity.position),
     health = entity.health,
-    max_health = entity.prototype and entity.prototype.max_health or nil,
     direction = entity.direction,
     status = entity.status,
     active = entity.active,
@@ -943,7 +943,7 @@ local function write_arena_manifest()
   end
 end
 
-local function get_recent_scenario_events(scenario_name)
+runtime_ext.get_recent_scenario_events = function(scenario_name)
   ensure_globals()
 
   local events = {}
@@ -957,7 +957,7 @@ local function get_recent_scenario_events(scenario_name)
   return events
 end
 
-local function event_sequence_matches(events, expected_sequence)
+runtime_ext.event_sequence_matches = function(events, expected_sequence)
   local event_index = 1
   local matched = {}
   local missing = {}
@@ -979,7 +979,7 @@ local function event_sequence_matches(events, expected_sequence)
   return #missing == 0, matched, missing
 end
 
-local function make_bridge_assertion(name, assertion_type, passed, expected, actual, evidence)
+runtime_ext.make_bridge_assertion = function(name, assertion_type, passed, expected, actual, evidence)
   return {
     name = name,
     type = assertion_type,
@@ -4580,7 +4580,7 @@ write_manual_dump = function(reason)
   write_arena_manifest()
 end
 
-local function setup_agent_bridge_scenario(scenario_name, player_index, options)
+runtime_ext.setup_agent_bridge_scenario = function(scenario_name, player_index, options)
   ensure_globals()
 
   local scenario = DEBUG_SCENARIOS[scenario_name]
@@ -4748,7 +4748,7 @@ script.on_nth_tick(PROCESS_INTERVAL, process_tracked_groups)
 end
 
 do
-local arena_runtime = {}
+arena_runtime = {}
 
 function arena_runtime.get_or_create_debug_surface()
   local surface = game.surfaces[DEBUG_ARENA_SURFACE_NAME]
@@ -5050,7 +5050,9 @@ function arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor
   storage.debug.arena = {
     scenario = scenario.name,
     surface_name = surface.name,
+    observe_position = serialize_position(scenario.observe_position),
     spawn_position = serialize_position(scenario.spawn_position),
+    target_position = serialize_position(scenario.target_position),
     wall_anchor_positions = wall_anchor_positions,
     turret_positions = turret_positions,
     structure_positions = structure_positions,
@@ -5160,57 +5162,10 @@ local function command_debug_arena(command)
     return
   end
 
-  local surface = arena_runtime.get_or_create_debug_surface()
-  purge_surface_runtime_state(surface.index)
-  arena_runtime.clear_debug_surface(surface)
-  clear_debug_runtime()
-  storage.debug.arena = nil
-
-  if command.player_index then
-    set_debug_enabled(command.player_index, true)
-  end
-
-  local wall_anchor_positions = arena_runtime.build_wall_segments(surface, "player", scenario)
-  local turret_positions = arena_runtime.build_turrets(surface, "player", scenario)
-  local structure_positions = arena_runtime.build_structures(surface, "player", scenario)
-  arena_runtime.seed_reuse_site(surface, scenario)
-  arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions, structure_positions)
-
-  local scenario_waves = scenario.waves or {{
-    delay = 0,
-    spawn_position = scenario.spawn_position,
-    target_position = scenario.target_position,
-    units = scenario.units
-  }}
-
-  if #scenario_waves > 0 then
-    storage.debug.arena.pending_waves = {}
-    for wave_index = 1, #scenario_waves do
-      local wave = scenario_waves[wave_index]
-      if (wave.delay or 0) <= 0 then
-        arena_runtime.spawn_debug_group(surface, scenario, wave, wave_index)
-        storage.debug.arena.spawned_wave_count = storage.debug.arena.spawned_wave_count + 1
-      else
-        storage.debug.arena.pending_waves[#storage.debug.arena.pending_waves + 1] = {
-          index = wave_index,
-          spawn_tick = game.tick + (wave.delay or 0),
-          spawn_position = copy_position(wave.spawn_position),
-          target_position = copy_position(wave.target_position),
-          units = wave.units
-        }
-      end
-    end
-
-    for _, site in pairs(storage.siege_sites) do
-      if site.surface_index == surface.index then
-        site.wave_count = storage.debug.arena.spawned_wave_count
-      end
-    end
-  end
+  local setup = runtime_ext.setup_agent_bridge_scenario(scenario_name, command.player_index, {reason = "arena-created"})
+  local surface = game.surfaces[setup.surface_name]
 
   if player and player.valid then
-    player.teleport(scenario.observe_position, surface)
-    arena_runtime.chart_debug_surface(surface, player)
     player.print({"advanced-biter-tactics.debug-arena-created",
       scenario.name,
       surface.name,
@@ -5243,11 +5198,204 @@ local function command_debug_arena(command)
       game.print({"advanced-biter-tactics.debug-arena-wave-count", scenario.expected_reuse_wave_count})
     end
   end
-
-  write_manual_dump("arena-created")
 end
 
 commands.add_command("abt-debug-arena", {"advanced-biter-tactics.command-help-arena"}, command_debug_arena)
+
+remote.add_interface("agent_bridge", {
+  list_scenarios = function()
+    local scenarios = {}
+    for name, scenario in pairs(DEBUG_SCENARIOS) do
+      scenarios[#scenarios + 1] = {
+        name = name,
+        observe_position = serialize_position(scenario.observe_position),
+        spawn_position = serialize_position(scenario.spawn_position),
+        target_position = serialize_position(scenario.target_position),
+        expected_support_mode = scenario.expected_support_mode,
+        expected_reuse_wave_count = scenario.expected_reuse_wave_count,
+        expected_behavior = scenario.expected_behavior,
+        expected_event_sequence = scenario.expected_event_sequence
+      }
+    end
+
+    table.sort(scenarios, function(left, right)
+      return left.name < right.name
+    end)
+
+    return scenarios
+  end,
+  setup_scenario = function(name, options)
+    return runtime_ext.setup_agent_bridge_scenario(name, nil, options)
+  end,
+  capture_frame = function(options)
+    ensure_globals()
+
+    local arena = storage.debug.arena
+    if not arena then
+      return nil
+    end
+
+    local surface = arena.surface_name and game.surfaces[arena.surface_name] or nil
+    if not surface then
+      return nil
+    end
+
+    local radius = options and tonumber(options.radius) or 48
+    local center = arena.observe_position or arena.spawn_position or {x = 0, y = 0}
+    local bounds = {
+      left_top = {
+        x = center.x - radius,
+        y = center.y - radius
+      },
+      right_bottom = {
+        x = center.x + radius,
+        y = center.y + radius
+      }
+    }
+
+    local visible_entities = {}
+    local entities = surface.find_entities_filtered({area = bounds})
+    for index = 1, #entities do
+      visible_entities[#visible_entities + 1] = runtime_ext.serialize_visible_entity(entities[index])
+    end
+
+    local groups = {}
+    for _, record in pairs(storage.group_ai) do
+      if record.scenario == arena.scenario then
+        groups[#groups + 1] = serialize_record(record)
+      end
+    end
+
+    local siege_sites = {}
+    for _, site in pairs(storage.siege_sites) do
+      if site.surface_index == surface.index then
+        siege_sites[#siege_sites + 1] = serialize_site(site)
+      end
+    end
+
+    return {
+      tick = game.tick,
+      mod_name = MOD_NAME,
+      scenario_name = arena.scenario,
+      reason = options and options.reason or "capture",
+      active_surface = surface.name,
+      viewport = {
+        center = serialize_position(center),
+        radius = radius,
+        bounds = serialize_bounds(bounds)
+      },
+      visible_entities = visible_entities,
+      alerts = {},
+      sounds = {},
+      gui = {
+        root = "none",
+        children = {}
+      },
+      scenario_markers = {
+        observe_position = serialize_position(arena.observe_position),
+        spawn_position = serialize_position(arena.spawn_position),
+        target_position = serialize_position(arena.target_position),
+        open_breach_positions = serialize_positions(arena.open_breach_positions),
+        viewport_hint = runtime_ext.serialize_area_from_center(center, radius)
+      },
+      groups = groups,
+      siege_sites = siege_sites,
+      recent_events = runtime_ext.get_recent_scenario_events(arena.scenario)
+    }
+  end,
+  evaluate_assertions = function(name, options)
+    ensure_globals()
+
+    local arena = storage.debug.arena
+    local scenario_name = name or (arena and arena.scenario) or nil
+    local scenario = scenario_name and DEBUG_SCENARIOS[scenario_name] or nil
+    local assertions = {}
+    local events = runtime_ext.get_recent_scenario_events(scenario_name)
+    local has_arena = arena ~= nil and scenario ~= nil and arena.scenario == scenario_name
+
+    assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+      "arena-created",
+      "invariant",
+      has_arena,
+      true,
+      has_arena,
+      {
+        scenario_name = scenario_name,
+        active_scenario = arena and arena.scenario or nil
+      }
+    )
+
+    if scenario then
+      local actual_event_names = {}
+      for index = 1, #events do
+        actual_event_names[index] = events[index].event
+      end
+
+      local matches_sequence, matched, missing = runtime_ext.event_sequence_matches(events, scenario.expected_event_sequence or {})
+      assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+        "expected-event-sequence",
+        "sequence",
+        matches_sequence,
+        scenario.expected_event_sequence,
+        actual_event_names,
+        {
+          matched = matched,
+          missing = missing
+        }
+      )
+
+      if scenario.expected_support_mode then
+        local actual_support_mode = nil
+        local arena_surface = arena and game.surfaces[arena.surface_name] or nil
+        for _, site in pairs(storage.siege_sites) do
+          if arena_surface and site.surface_index == arena_surface.index and site.support_mode ~= nil and site.support_mode ~= "none" then
+            actual_support_mode = site.support_mode
+            break
+          end
+        end
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "support-mode",
+          "outcome",
+          actual_support_mode == scenario.expected_support_mode,
+          scenario.expected_support_mode,
+          actual_support_mode,
+          options or {}
+        )
+      end
+
+      if scenario.expected_reuse_wave_count then
+        local actual_wave_count = arena and arena.spawned_wave_count or 0
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "reuse-wave-count",
+          "outcome",
+          actual_wave_count == scenario.expected_reuse_wave_count,
+          scenario.expected_reuse_wave_count,
+          actual_wave_count,
+          options or {}
+        )
+      end
+    end
+
+    return assertions
+  end,
+  reset_scenario = function()
+    ensure_globals()
+
+    if storage.debug and storage.debug.arena and storage.debug.arena.surface_name and game.surfaces[storage.debug.arena.surface_name] then
+      local surface = game.surfaces[storage.debug.arena.surface_name]
+      purge_surface_runtime_state(surface.index)
+      arena_runtime.clear_debug_surface(surface)
+    end
+
+    clear_debug_runtime()
+    storage.debug.arena = nil
+    set_debug_enabled(0, false)
+
+    return {
+      reset = true
+    }
+  end
+})
 end
 
 do
