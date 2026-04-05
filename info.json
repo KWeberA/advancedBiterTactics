@@ -1,0 +1,9 @@
+{
+  "name": "advanced-biter-tactics",
+  "version": "0.1.0",
+  "title": "Advanced Biter Tactics",
+  "author": "Contributors",
+  "description": "Uses local wall heuristics to reroute enemy attack groups away from turret-covered contacts and toward weaker nearby breaches.",
+  "factorio_version": "2.0",
+  "dependencies": ["base >= 2.0.0"]
+}
