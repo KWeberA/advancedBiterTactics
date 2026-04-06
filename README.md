@@ -40,3 +40,9 @@ VS Code:
 - Use `Run and Debug` with `Factorio: Run Startup Smoke Test` or `Terminal -> Run Task -> Factorio: Run Startup Smoke Test` to run the non-interactive startup smoke test that waits for Factorio to reach `InGame` and then shuts it down again.
 - `Factorio: Sync Test Mod Files` runs automatically before both Run-and-Debug entries and before the startup smoke-test task, so you normally do not need to run it by hand.
 - The VS Code helper logic lives in `.vscode/factorio-vscode.ps1`, so the workflow does not depend on long inline shell commands or on your default integrated terminal shell.
+
+Agent bridge runs:
+
+- `tools/run-agent-bridge.ps1 -Scenario wall-open -FactorioExe 'E:\SteamLibrary\steamapps\common\Factorio\bin\x64\factorio.exe'` runs a deterministic bridge-backed scenario and writes artifacts under `.factorio-test/user-data/script-output/agent-bridge-runs/<run-id>/`.
+- Each run writes `run-manifest.json`, `events.jsonl`, `frames/frame-<tick>.json`, `assertions.json`, and `summary.json`.
+- The runner builds a temporary harness mod locally inside `.factorio-test/`, so no extra tracked test artifacts are added to the repo.

@@ -24,6 +24,8 @@ local DESIRED_BREACH_SEGMENTS = 3
 local MIN_BREACH_SEGMENTS = 2
 local SUPPORT_MAX_DRIFT = 4
 local SUPPORT_RETURN_RADIUS = 2
+local SUPPORT_STANDOFF_MIN_DISTANCE = 4
+local MOVE_REASSERT_TICKS = 60
 local BREACH_TARGET_RADIUS = 0.6
 local BREACH_TARGET_SEARCH_DISTANCE = 3.1
 local LOCAL_ASSAULT_RADIUS = 32
@@ -32,12 +34,16 @@ local INSIDE_RALLY_DISTANCE = 6
 local BREACH_EXPLOIT_DISTANCE = 12
 local BREACH_CORRIDOR_DISTANCE = 6
 local POST_BREACH_ENTRY_RADIUS = 3
+local POST_BREACH_ASSAULT_HANDOFF_TICKS = 180
 local MAX_MELEE_PER_TURRET = 10
 local SUPPORT_FOLLOW_TRIGGER_DISTANCE = 6
 local SUPPORT_FOLLOW_DISTANCE = 5
 local SUPPORT_FOLLOW_MIN_DISTANCE = 2
 local BREACH_PRESSURE_TIMEOUT = 240
 local BREACH_PRESSURE_EVENT_COOLDOWN = 30
+local STALL_TIMEOUT_TICKS = 360
+local COVERAGE_PATH_SAMPLE_SPACING = 1.5
+local MEANINGFUL_PROGRESS_DISTANCE_SQ = 2.25
 local FLAME_LANE_COUNT = 3
 local FLAME_LANE_SPREAD = 4
 local FLAME_HAZARD_RADIUS = 2.5
@@ -53,8 +59,12 @@ local DEBUG_FILES = {
   arena_manifest = DEBUG_DIR .. "/arena-manifest.json"
 }
 local DEBUG_RECENT_EVENT_LIMIT = 32
+local DEBUG_SCENARIO_EVENT_LIMIT = 512
 local DEBUG_STATUS_EVENT_LIMIT = 10
 local DEBUG_OVERLAY_CANDIDATE_LIMIT = 8
+local DEBUG_OVERLAY_GROUP_LIMIT = 16
+local DEBUG_OVERLAY_SITE_LIMIT = 8
+local DEBUG_OVERLAY_VIEW_RADIUS = 96
 local DEBUG_ARENA_SURFACE_NAME = "abt-debug-arena"
 local DEBUG_ARENA_TILE_HALF_SIZE = 64
 
@@ -67,7 +77,7 @@ local CARDINAL_SIDES = {
   {name = "west", dx = -1, dy = 0}
 }
 
-local DEBUG_EVENT_NAMES = {
+DEBUG_EVENT_NAMES = {
   group_registered = true,
   arena_wave_spawned = true,
   contact_found = true,
@@ -81,6 +91,7 @@ local DEBUG_EVENT_NAMES = {
   support_position_rejected = true,
   standoff_position_selected = true,
   breach_pressure_detected = true,
+  breach_pressure_lost = true,
   breach_progress_updated = true,
   breach_assault_planned = true,
   turret_priority_selected = true,
@@ -93,23 +104,36 @@ local DEBUG_EVENT_NAMES = {
   fire_hazard_avoided = true,
   open_entry_taken = true,
   interior_target_selected = true,
+  wall_target_after_breach = true,
   breach_reused = true,
+  coverage_violation = true,
+  command_reasserted = true,
+  unsafe_rally_replanned = true,
+  state_stalled = true,
+  support_mode_replanned = true,
+  entry_progress_updated = true,
   fallback_issued = true,
   group_cleanup = true
 }
 
-local count_open_breach_segments
-local get_site_for_record
-local process_debug_arena_waves
-local ensure_entry_traversed
-local require_admin_or_server
-local parse_command_parameter
-local write_manual_dump
-local set_debug_enabled
-local clear_debug_runtime
-local command_debug
-local runtime_ext = {}
-local DEBUG_SCENARIOS = {
+count_open_breach_segments = nil
+get_site_for_record = nil
+process_debug_arena_waves = nil
+ensure_entry_traversed = nil
+require_admin_or_server = nil
+parse_command_parameter = nil
+write_manual_dump = nil
+set_debug_enabled = nil
+clear_debug_runtime = nil
+get_runtime_group_diagnostics = nil
+find_covering_turrets = nil
+sample_line_positions = nil
+serialize_turret_sources = nil
+clear_command = nil
+start_fallback_attack = nil
+runtime_ext = {}
+arena_runtime = nil
+DEBUG_SCENARIOS = {
   ["wall-open"] = {
     name = "wall-open",
     spawn_position = {x = -16, y = 0},
@@ -232,11 +256,14 @@ local DEBUG_SCENARIOS = {
       {position = {x = 8, y = -4}, ammo = 200},
       {position = {x = 8, y = 4}, ammo = 200}
     },
+    structures = {
+      {name = "radar", position = {x = 10, y = 0}},
+      {name = "steel-chest", position = {x = 11, y = -2}},
+      {name = "steel-chest", position = {x = 11, y = 2}}
+    },
     units = {
-      {name = "medium-biter", count = 8},
-      {name = "big-biter", count = 4},
-      {name = "small-spitter", count = 6},
-      {name = "medium-spitter", count = 4}
+      {name = "behemoth-biter", count = 12},
+      {name = "big-spitter", count = 10}
     },
     expected_behavior = "Spitters should widen the breach from a safe standoff position while biters wait outside until the opening is at least two to three wall segments wide.",
     expected_event_sequence = {
@@ -244,27 +271,29 @@ local DEBUG_SCENARIOS = {
       "contact_found",
       "wall_network_scanned",
       "candidates_scored",
-      "siege_site_selected",
+      "support_mode_selected",
       "standoff_position_selected",
       "support_group_created",
-      "attack_selected"
+      "siege_site_selected",
+      "breach_assault_planned",
+      "interior_target_selected"
     }
   },
   ["mixed-turret-breach"] = {
     name = "mixed-turret-breach",
     spawn_position = {x = -18, y = 0},
     observe_position = {x = -36, y = 0},
-    target_position = {x = 36, y = 0},
+    target_position = {x = 48, y = 0},
     walls = {
-      {from = {x = 0, y = -10}, to = {x = 36, y = -10}},
-      {from = {x = 36, y = -10}, to = {x = 36, y = 10}},
-      {from = {x = 36, y = 10}, to = {x = 0, y = 10}},
+      {from = {x = 0, y = -10}, to = {x = 48, y = -10}},
+      {from = {x = 48, y = -10}, to = {x = 48, y = 10}},
+      {from = {x = 48, y = 10}, to = {x = 0, y = 10}},
       {from = {x = 0, y = 10}, to = {x = 0, y = -10}}
     },
     turrets = {
-      {name = "gun-turret", position = {x = 5, y = -5}, ammo = 200},
-      {name = "gun-turret", position = {x = 5, y = 0}, ammo = 200},
-      {name = "gun-turret", position = {x = 5, y = 5}, ammo = 200}
+      {name = "gun-turret", position = {x = 6, y = -5}, ammo = 200},
+      {name = "gun-turret", position = {x = 6, y = 0}, ammo = 200},
+      {name = "gun-turret", position = {x = 6, y = 5}, ammo = 200}
     },
     units = {
       {name = "medium-biter", count = 16},
@@ -311,10 +340,10 @@ local DEBUG_SCENARIOS = {
       "contact_found",
       "wall_network_scanned",
       "candidates_scored",
-      "siege_site_selected",
       "support_mode_selected",
       "ranged_cone_group_created",
       "ranged_cone_lane_set",
+      "siege_site_selected",
       "breach_assault_planned",
       "turret_priority_selected",
       "flame_lane_set"
@@ -329,8 +358,8 @@ local DEBUG_SCENARIOS = {
       {from = {x = 0, y = -10}, to = {x = 18, y = -10}},
       {from = {x = 18, y = -10}, to = {x = 18, y = 10}},
       {from = {x = 18, y = 10}, to = {x = 0, y = 10}},
-      {from = {x = 0, y = -10}, to = {x = 0, y = -3}},
-      {from = {x = 0, y = 3}, to = {x = 0, y = 10}}
+      {from = {x = 0, y = -10}, to = {x = 0, y = -5}},
+      {from = {x = 0, y = 5}, to = {x = 0, y = 10}}
     },
     turrets = {
       {name = "gun-turret", position = {x = 8, y = -4}, ammo = 200},
@@ -342,11 +371,15 @@ local DEBUG_SCENARIOS = {
       {name = "steel-chest", position = {x = 16, y = 2}}
     },
     open_breach_positions = {
+      {x = 0, y = -4},
+      {x = 0, y = -3},
       {x = 0, y = -2},
       {x = 0, y = -1},
       {x = 0, y = 0},
       {x = 0, y = 1},
-      {x = 0, y = 2}
+      {x = 0, y = 2},
+      {x = 0, y = 3},
+      {x = 0, y = 4}
     },
     waves = {
       {
@@ -371,7 +404,6 @@ local DEBUG_SCENARIOS = {
       }
     },
     reuse_site = true,
-    expected_support_mode = "open-entry-reuse",
     expected_reuse_wave_count = 2,
     expected_behavior = "Wave one should move through the already open breach before prioritizing interior gun turrets, and wave two should reuse that same opening instead of starting a fresh wall attack.",
     expected_event_sequence = {
@@ -448,6 +480,7 @@ local function ensure_globals()
   storage.debug = storage.debug or {}
   storage.debug.enabled_players = storage.debug.enabled_players or {}
   storage.debug.recent_events = storage.debug.recent_events or {}
+  storage.debug.scenario_events = storage.debug.scenario_events or {}
   storage.debug.server_capture = storage.debug.server_capture or false
   storage.debug.arena = storage.debug.arena or nil
 end
@@ -482,6 +515,51 @@ local function get_overlay_player_indices()
   return sanitize_debug_players()
 end
 
+local function get_overlay_player_contexts()
+  ensure_globals()
+  local player_indices = sanitize_debug_players()
+  local contexts = {}
+
+  for index = 1, #player_indices do
+    local player = game.get_player(player_indices[index])
+    if player and player.valid and player.surface then
+      contexts[#contexts + 1] = {
+        player_index = player.index,
+        surface_index = player.surface.index,
+        position = copy_position(player.position)
+      }
+    end
+  end
+
+  return contexts
+end
+
+local function overlay_surface_is_visible(contexts, surface_index)
+  for index = 1, #contexts do
+    if contexts[index].surface_index == surface_index then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function overlay_position_is_visible(contexts, surface_index, position)
+  if not position then
+    return false
+  end
+
+  local view_radius_sq = DEBUG_OVERLAY_VIEW_RADIUS * DEBUG_OVERLAY_VIEW_RADIUS
+  for index = 1, #contexts do
+    local context = contexts[index]
+    if context.surface_index == surface_index and distance_sq(context.position, position) <= view_radius_sq then
+      return true
+    end
+  end
+
+  return false
+end
+
 local function is_debug_capture_enabled()
   ensure_globals()
 
@@ -511,6 +589,21 @@ end
 local function trim_recent_events()
   while #storage.debug.recent_events > DEBUG_RECENT_EVENT_LIMIT do
     table.remove(storage.debug.recent_events, 1)
+  end
+end
+
+local function trim_scenario_events(scenario_name)
+  if not scenario_name then
+    return
+  end
+
+  local events = storage.debug.scenario_events[scenario_name]
+  if not events then
+    return
+  end
+
+  while #events > DEBUG_SCENARIO_EVENT_LIMIT do
+    table.remove(events, 1)
   end
 end
 
@@ -546,6 +639,19 @@ local function serialize_bounds(bounds)
     left_top = serialize_position(bounds.left_top),
     right_bottom = serialize_position(bounds.right_bottom)
   }
+end
+
+runtime_ext.serialize_area_from_center = function(position, radius)
+  return serialize_bounds({
+    left_top = {
+      x = position.x - radius,
+      y = position.y - radius
+    },
+    right_bottom = {
+      x = position.x + radius,
+      y = position.y + radius
+    }
+  })
 end
 
 local function average_positions(positions)
@@ -641,13 +747,23 @@ local function normalize_group_record(record)
   record.breach_replan_used = record.breach_replan_used == true
   record.reserve_registered = record.reserve_registered == true
   record.entry_open = record.entry_open == true
+  record.last_state_name = record.last_state_name or record.state
+  record.state_since_tick = tonumber(record.state_since_tick) or game.tick
+  record.last_meaningful_progress_tick = tonumber(record.last_meaningful_progress_tick) or record.activated_tick or game.tick
+  record.progress_anchor_position = record.progress_anchor_position and copy_position(record.progress_anchor_position) or nil
+  record.last_stalled_state = record.last_stalled_state or nil
+  record.entry_progress_stage = record.entry_progress_stage or nil
+  record.entry_progress = tonumber(record.entry_progress) or nil
+  record.last_breach_pressure_lost_tick = tonumber(record.last_breach_pressure_lost_tick) or nil
 
   local group = get_group(record)
   if group then
     record.surface_name = group.surface.name
     record.last_position = copy_position(group.position)
+    record.progress_anchor_position = record.progress_anchor_position or copy_position(group.position)
   elseif record.last_position then
     record.last_position = copy_position(record.last_position)
+    record.progress_anchor_position = record.progress_anchor_position or copy_position(record.last_position)
   end
 
   return record
@@ -669,6 +785,8 @@ local function normalize_site(site)
   site.entry_position = site.entry_position and copy_position(site.entry_position) or nil
   site.inside_rally_position = site.inside_rally_position and copy_position(site.inside_rally_position) or nil
   site.exploit_position = site.exploit_position and copy_position(site.exploit_position) or nil
+  site.seeded_inside_rally_position = site.seeded_inside_rally_position and copy_position(site.seeded_inside_rally_position) or nil
+  site.seeded_exploit_position = site.seeded_exploit_position and copy_position(site.seeded_exploit_position) or nil
   site.approach_side = site.approach_side or nil
   site.support_rejection_reason = site.support_rejection_reason or nil
   site.cone_lane_positions = copy_positions(site.cone_lane_positions)
@@ -807,6 +925,8 @@ local function serialize_site(site)
     flame_hazard_bounds = serialize_bounds(site.flame_hazard_bounds),
     defense_force_name = site.defense_force_name,
     last_breach_pressure_tick = site.last_breach_pressure_tick,
+    breach_pressure_active = site.last_breach_pressure_tick ~= nil
+      and (game.tick - site.last_breach_pressure_tick) <= STALL_TIMEOUT_TICKS,
     wave_count = site.wave_count,
     expires_tick = site.expires_tick
   }
@@ -814,6 +934,7 @@ end
 
 local function serialize_record(record)
   local group = get_group(record)
+  local diagnostics = get_runtime_group_diagnostics and get_runtime_group_diagnostics(record, group) or {}
 
   return {
     id = record.id,
@@ -829,7 +950,17 @@ local function serialize_record(record)
     member_count = group and count_group_members(group) or 0,
     activated_tick = record.activated_tick,
     last_seen_tick = record.last_seen_tick,
+    state_since_tick = record.state_since_tick,
+    state_duration_ticks = diagnostics.state_duration_ticks,
+    last_meaningful_progress_tick = record.last_meaningful_progress_tick,
     group_position = serialize_position(group and group.position or record.last_position),
+    in_turret_coverage = diagnostics.in_turret_coverage,
+    covering_turret_count = diagnostics.covering_turret_count,
+    coverage_sources = diagnostics.coverage_sources,
+    in_flame_hazard = diagnostics.in_flame_hazard,
+    hazard_score = diagnostics.hazard_score,
+    entry_progress = diagnostics.entry_progress,
+    breach_pressure_active = diagnostics.breach_pressure_active,
     target_position = serialize_position(record.target_position),
     approach_side = record.approach_side,
     rally_position = serialize_position(record.rally_position),
@@ -841,9 +972,12 @@ local function serialize_record(record)
     inside_rally_position = serialize_position(record.inside_rally_position),
     exploit_position = serialize_position(record.exploit_position),
     command_kind = record.command_kind,
+    command_distraction = record.command_distraction,
     command_status = record.command_status,
     command_result = record.command_result,
     command_target_position = serialize_position(record.command_target_position),
+    group_state = group and group.is_unit_group and group.state or nil,
+    script_command_preserved = record.command_status == "active",
     last_contact_position = serialize_position(record.last_contact_position),
     breach_positions = serialize_positions(record.breach_positions),
     breach_attack_order = serialize_positions(record.breach_attack_order),
@@ -861,7 +995,23 @@ local function serialize_record(record)
     selected_candidate_index = record.debug_selected_candidate_index,
     candidates = record.debug_candidates or {},
     analysis = record.debug_analysis,
-    flank_waypoints = serialize_positions(record.flank_waypoints)
+    flank_waypoints = serialize_positions(record.flank_waypoints),
+    entry_progress_stage = record.entry_progress_stage
+  }
+end
+
+runtime_ext.serialize_visible_entity = function(entity)
+  return {
+    name = entity.name,
+    type = entity.type,
+    force = entity.force and entity.force.name or nil,
+    unit_number = entity.unit_number,
+    position = serialize_position(entity.position),
+    health = entity.health,
+    direction = entity.direction,
+    status = entity.status,
+    active = entity.active,
+    destructible = entity.destructible
   }
 end
 
@@ -915,6 +1065,62 @@ local function write_arena_manifest()
   end
 end
 
+runtime_ext.get_recent_scenario_events = function(scenario_name)
+  ensure_globals()
+
+  if scenario_name and storage.debug.scenario_events[scenario_name] then
+    local scenario_events = {}
+    local stored_events = storage.debug.scenario_events[scenario_name]
+    for index = 1, #stored_events do
+      scenario_events[index] = stored_events[index]
+    end
+    return scenario_events
+  end
+
+  local events = {}
+  for index = 1, #storage.debug.recent_events do
+    local event = storage.debug.recent_events[index]
+    if scenario_name == nil or event.scenario == scenario_name then
+      events[#events + 1] = event
+    end
+  end
+
+  return events
+end
+
+runtime_ext.event_sequence_matches = function(events, expected_sequence)
+  local event_index = 1
+  local matched = {}
+  local missing = {}
+
+  for expected_index = 1, #expected_sequence do
+    local expected_event = expected_sequence[expected_index]
+    while event_index <= #events and events[event_index].event ~= expected_event do
+      event_index = event_index + 1
+    end
+
+    if event_index > #events then
+      missing[#missing + 1] = expected_event
+    else
+      matched[#matched + 1] = expected_event
+      event_index = event_index + 1
+    end
+  end
+
+  return #missing == 0, matched, missing
+end
+
+runtime_ext.make_bridge_assertion = function(name, assertion_type, passed, expected, actual, evidence)
+  return {
+    name = name,
+    type = assertion_type,
+    passed = passed,
+    expected = expected,
+    actual = actual,
+    evidence = evidence or {}
+  }
+end
+
 local function record_debug_event(event_name, record, extra)
   if not DEBUG_EVENT_NAMES[event_name] then
     return
@@ -950,15 +1156,176 @@ local function record_debug_event(event_name, record, extra)
     lane_index = extra and extra.lane_index or (record and record.lane_index or nil),
     hazard_score = extra and extra.hazard_score or nil,
     support_rejection_reason = extra and extra.support_rejection_reason or (record and record.support_rejection_reason or nil),
-    entry_open = extra and extra.entry_open or (record and record.entry_open or nil)
+    entry_open = extra and extra.entry_open or (record and record.entry_open or nil),
+    state_duration_ticks = record and record.state_since_tick and (game.tick - record.state_since_tick) or nil,
+    last_meaningful_progress_tick = record and record.last_meaningful_progress_tick or nil,
+    entry_progress = extra and extra.entry_progress or (record and record.entry_progress or nil),
+    command_kind = extra and extra.command_kind or (record and record.command_kind or nil),
+    command_distraction = extra and extra.command_distraction or (record and record.command_distraction or nil),
+    command_target_position = serialize_position(extra and extra.command_target_position or (record and record.command_target_position or nil)),
+    group_state = group and group.is_unit_group and group.state or nil,
+    script_command_preserved = extra and extra.script_command_preserved or ((record and record.command_status == "active") or nil),
+    coverage_sources = extra and extra.coverage_sources or nil,
+    covering_turret_count = extra and extra.covering_turret_count or nil,
+    in_turret_coverage = extra and extra.in_turret_coverage or nil,
+    in_flame_hazard = extra and extra.in_flame_hazard or nil,
+    breach_pressure_active = extra and extra.breach_pressure_active or nil
   }
 
   storage.debug.recent_events[#storage.debug.recent_events + 1] = payload
   trim_recent_events()
+  if payload.scenario then
+    storage.debug.scenario_events[payload.scenario] = storage.debug.scenario_events[payload.scenario] or {}
+    storage.debug.scenario_events[payload.scenario][#storage.debug.scenario_events[payload.scenario] + 1] = payload
+    trim_scenario_events(payload.scenario)
+  end
 
   if is_debug_capture_enabled() then
     append_jsonl(DEBUG_FILES.events, payload)
   end
+end
+
+local function note_meaningful_progress(record, position)
+  if not record then
+    return
+  end
+
+  record.last_meaningful_progress_tick = game.tick
+  if position then
+    record.progress_anchor_position = copy_position(position)
+  end
+end
+
+local function sync_record_runtime_state(record, group)
+  if record.last_state_name ~= record.state then
+    record.last_state_name = record.state
+    record.state_since_tick = game.tick
+    record.last_stalled_state = nil
+    note_meaningful_progress(record, group and group.position or record.last_position)
+  end
+
+  if group and (
+    not record.progress_anchor_position
+    or distance_sq(group.position, record.progress_anchor_position) >= MEANINGFUL_PROGRESS_DISTANCE_SQ
+  ) then
+    note_meaningful_progress(record, group.position)
+  end
+
+  local site = get_site_for_record and get_site_for_record(record) or nil
+  if site and group then
+    local progress = runtime_ext.get_breach_entry_progress(site, group.position)
+    record.entry_progress = progress
+  else
+    record.entry_progress = nil
+  end
+end
+
+local function prebreach_safety_required(record)
+  if not record or record.entry_open then
+    return false
+  end
+
+  if record.role == "support" then
+    return record.support_mode == "safe-standoff" or record.support_mode == "cone-siege"
+  end
+
+  return record.state == "flanking"
+    or record.state == "rallying"
+    or record.state == "breach-waiting"
+    or record.waiting_for_breach == true
+    or record.support_mode == "safe-standoff"
+    or record.support_mode == "cone-siege"
+end
+
+local function emit_coverage_violation(record, position, reason, turrets)
+  record_debug_event("coverage_violation", record, {
+    reason = reason,
+    target_position = position,
+    in_turret_coverage = true,
+    covering_turret_count = turrets and #turrets or 0,
+    coverage_sources = serialize_turret_sources(turrets or {})
+  })
+end
+
+local function handle_state_stall(record, group)
+  if not record.last_meaningful_progress_tick then
+    return false
+  end
+
+  local state = record.state
+  if state ~= "support-moving"
+    and state ~= "support-resetting"
+    and state ~= "support-sieging"
+    and state ~= "rallying"
+    and state ~= "breach-waiting"
+    and state ~= "flanking" then
+    return false
+  end
+
+  if game.tick - record.last_meaningful_progress_tick < STALL_TIMEOUT_TICKS then
+    return false
+  end
+
+  if record.last_stalled_state == state then
+    return false
+  end
+
+  record.last_stalled_state = state
+  record_debug_event("state_stalled", record, {
+    reason = state,
+    target_position = record.command_target_position or record.target_position,
+    support_mode = record.support_mode,
+    entry_progress = record.entry_progress
+  })
+
+  if record.role == "support" then
+    local site = get_site_for_record(record)
+    if not site then
+      return false
+    end
+
+    local previous_mode = record.support_mode or "none"
+    local next_mode = previous_mode
+    if previous_mode == "safe-standoff" and site.cone_lane_positions and #site.cone_lane_positions > 0 then
+      next_mode = "cone-siege"
+      record.lane_positions = copy_positions(site.cone_lane_positions)
+      record.lane_index = math.ceil(#site.cone_lane_positions / 2)
+      record.support_position = copy_position(site.cone_lane_positions[record.lane_index])
+    elseif previous_mode == "cone-siege" and site.support_position and #find_covering_turrets(group.surface, group.force, site.support_position) == 0 then
+      next_mode = "safe-standoff"
+      record.lane_positions = nil
+      record.lane_index = nil
+      record.support_position = copy_position(site.support_position)
+    else
+      next_mode = "none"
+    end
+
+    if next_mode ~= previous_mode then
+      record.support_mode = next_mode
+      site.support_mode = next_mode
+      site.support_position = record.support_position and copy_position(record.support_position) or site.support_position
+      clear_command(record)
+      record_debug_event("support_mode_replanned", record, {
+        reason = "state-stalled",
+        support_mode = next_mode,
+        target_position = record.support_position or record.target_position
+      })
+      note_meaningful_progress(record, group.position)
+      if next_mode == "none" then
+        start_fallback_attack(record, group, "support-stalled")
+      else
+        record.state = "support-moving"
+      end
+      return true
+    end
+  end
+
+  if state == "rallying" or state == "breach-waiting" then
+    clear_command(record)
+    note_meaningful_progress(record, group.position)
+  end
+
+  return false
 end
 
 local function is_enemy_force(force)
@@ -1029,7 +1396,7 @@ local function is_position_walkable(surface, position, probe_unit_name)
   })
 end
 
-local function find_covering_turrets(surface, enemy_force, position)
+find_covering_turrets = function(surface, enemy_force, position)
   local nearby_turrets = surface.find_entities_filtered({
     position = position,
     radius = 32,
@@ -1055,15 +1422,132 @@ local function find_covering_turrets(surface, enemy_force, position)
   return covering_turrets, max_cover_range
 end
 
+serialize_turret_sources = function(turrets)
+  local sources = {}
+  for index = 1, #turrets do
+    local turret = turrets[index]
+    if turret.valid then
+      sources[#sources + 1] = {
+        name = turret.name,
+        position = serialize_position(turret.position),
+        range = round_number(get_attack_range(turret), 2)
+      }
+    end
+  end
+  return sources
+end
+
+local function get_position_fire_hazard(surface, position)
+  if not (surface and position) then
+    return 0, {}
+  end
+
+  local fires = surface.find_entities_filtered({
+    position = position,
+    radius = FLAME_HAZARD_RADIUS
+  })
+  local hazard_positions = {}
+  local hazard_score = 0
+
+  for index = 1, #fires do
+    local entity = fires[index]
+    if entity.valid and entity.type == "fire" then
+      hazard_positions[#hazard_positions + 1] = copy_position(entity.position)
+      hazard_score = hazard_score + math.max(1, math.floor((FLAME_HAZARD_RADIUS * FLAME_HAZARD_RADIUS - distance_sq(position, entity.position)) + 0.5))
+    end
+  end
+
+  return hazard_score, hazard_positions
+end
+
+local function path_has_turret_coverage(surface, enemy_force, from_position, to_position)
+  if not (surface and from_position and to_position) then
+    return false, {}
+  end
+
+  local distance = math.sqrt(distance_sq(from_position, to_position))
+  local sample_count = math.max(1, math.ceil(distance / COVERAGE_PATH_SAMPLE_SPACING))
+  local samples = sample_line_positions(from_position, to_position, sample_count)
+  local seen = {}
+  local sources = {}
+
+  for index = 1, #samples do
+    local covering_turrets = find_covering_turrets(surface, enemy_force, samples[index])
+    if #covering_turrets > 0 then
+      for turret_index = 1, #covering_turrets do
+        local turret = covering_turrets[turret_index]
+        local turret_key = turret.valid and position_key(turret.position) or nil
+        if turret.valid and turret_key and not seen[turret_key] then
+          seen[turret_key] = true
+          sources[#sources + 1] = turret
+        end
+      end
+    end
+  end
+
+  return #sources > 0, sources
+end
+
+get_runtime_group_diagnostics = function(record, group)
+  local diagnostics = {
+    state_duration_ticks = record and record.state_since_tick and (game.tick - record.state_since_tick) or nil,
+    in_turret_coverage = false,
+    covering_turret_count = 0,
+    coverage_sources = {},
+    in_flame_hazard = false,
+    hazard_score = 0,
+    entry_progress = record and record.entry_progress or nil,
+    breach_pressure_active = false
+  }
+
+  if record and record.siege_site_id then
+    local site = storage.siege_sites[record.siege_site_id]
+    if site and site.last_breach_pressure_tick then
+      diagnostics.breach_pressure_active = (game.tick - site.last_breach_pressure_tick) <= STALL_TIMEOUT_TICKS
+    end
+  end
+
+  if not group then
+    return diagnostics
+  end
+
+  local covering_turrets = find_covering_turrets(group.surface, group.force, group.position)
+  diagnostics.in_turret_coverage = #covering_turrets > 0
+  diagnostics.covering_turret_count = #covering_turrets
+  diagnostics.coverage_sources = serialize_turret_sources(covering_turrets)
+
+  local hazard_score, hazards = get_position_fire_hazard(group.surface, group.position)
+  diagnostics.in_flame_hazard = hazard_score > 0
+  diagnostics.hazard_score = hazard_score
+  if #hazards > 0 then
+    diagnostics.hazard_positions = serialize_positions(hazards)
+  end
+
+  if record and record.siege_site_id then
+    local site = storage.siege_sites[record.siege_site_id]
+    if site then
+      local progress = runtime_ext.get_breach_entry_progress(site, group.position)
+      diagnostics.entry_progress = progress
+    end
+  end
+
+  return diagnostics
+end
+
 local function choose_outside_sample(samples, reference_position)
   local best_sample
+  local best_cover_count
   local best_distance
 
   for index = 1, #samples do
     local sample = samples[index]
     local sample_distance = distance_sq(sample.position, reference_position)
-    if not best_distance or sample_distance < best_distance then
+    local sample_cover_count = sample.cover_count or 0
+    if not best_sample
+      or sample_cover_count < best_cover_count
+      or (sample_cover_count == best_cover_count and sample_distance < best_distance) then
       best_sample = sample
+      best_cover_count = sample_cover_count
       best_distance = sample_distance
     end
   end
@@ -1191,9 +1675,11 @@ local function analyze_wall_network(group, start_entity)
       local side = CARDINAL_SIDES[side_index]
       local sample_position = offset_position(node.position, side.dx * OUTSIDE_SAMPLE_OFFSET, side.dy * OUTSIDE_SAMPLE_OFFSET)
       if is_position_walkable(surface, sample_position, probe_unit_name) then
+        local sample_cover_turrets = find_covering_turrets(surface, enemy_force, sample_position)
         node.outside_samples[#node.outside_samples + 1] = {
           direction = side.name,
-          position = sample_position
+          position = sample_position,
+          cover_count = #sample_cover_turrets
         }
       end
     end
@@ -1415,16 +1901,128 @@ local function build_flank_waypoints(analysis, current_candidate, best_candidate
   return waypoints
 end
 
+function runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate)
+  if not (analysis and current_candidate and best_candidate and current_candidate.outside_position and best_candidate.outside_position) then
+    return {}
+  end
+
+  local min_x, max_x, min_y, max_y
+  for _, node in pairs(analysis.nodes or {}) do
+    if node and node.position then
+      min_x = min_x and math.min(min_x, node.position.x) or node.position.x
+      max_x = max_x and math.max(max_x, node.position.x) or node.position.x
+      min_y = min_y and math.min(min_y, node.position.y) or node.position.y
+      max_y = max_y and math.max(max_y, node.position.y) or node.position.y
+    end
+  end
+
+  if not (min_x and max_x and min_y and max_y) then
+    return {}
+  end
+
+  local margin = math.max(
+    OUTSIDE_SAMPLE_OFFSET + 3,
+    (current_candidate.max_cover_range or 0) + 4,
+    (best_candidate.max_cover_range or 0) + 4
+  )
+  local west_x = min_x - margin
+  local east_x = max_x + margin
+  local north_y = min_y - margin
+  local south_y = max_y + margin
+  local current = current_candidate.outside_position
+  local best = best_candidate.outside_position
+  local routes = {}
+
+  if current_candidate.outside_direction == "west" and best_candidate.outside_direction == "east" then
+    routes[1] = {
+      {x = west_x, y = north_y},
+      {x = east_x, y = north_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = west_x, y = south_y},
+      {x = east_x, y = south_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "east" and best_candidate.outside_direction == "west" then
+    routes[1] = {
+      {x = east_x, y = north_y},
+      {x = west_x, y = north_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = east_x, y = south_y},
+      {x = west_x, y = south_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "north" and best_candidate.outside_direction == "south" then
+    routes[1] = {
+      {x = west_x, y = north_y},
+      {x = west_x, y = south_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = east_x, y = north_y},
+      {x = east_x, y = south_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "south" and best_candidate.outside_direction == "north" then
+    routes[1] = {
+      {x = west_x, y = south_y},
+      {x = west_x, y = north_y},
+      copy_position(best)
+    }
+    routes[2] = {
+      {x = east_x, y = south_y},
+      {x = east_x, y = north_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "west" and best_candidate.outside_direction == "west" then
+    routes[1] = {
+      {x = west_x, y = current.y},
+      {x = west_x, y = best.y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "east" and best_candidate.outside_direction == "east" then
+    routes[1] = {
+      {x = east_x, y = current.y},
+      {x = east_x, y = best.y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "north" and best_candidate.outside_direction == "north" then
+    routes[1] = {
+      {x = current.x, y = north_y},
+      {x = best.x, y = north_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "south" and best_candidate.outside_direction == "south" then
+    routes[1] = {
+      {x = current.x, y = south_y},
+      {x = best.x, y = south_y},
+      copy_position(best)
+    }
+  else
+    routes[1] = {
+      copy_position(best)
+    }
+  end
+
+  return routes
+end
+
 local function filter_safe_flank_waypoints(group, waypoints, preferred_position)
   if not group or #waypoints == 0 then
     return waypoints
   end
 
   local safe_waypoints = {}
+  local previous_position = group.position
   for index = 1, #waypoints do
     local waypoint = waypoints[index]
-    if #find_covering_turrets(group.surface, group.force, waypoint) == 0 then
+    local path_covered = path_has_turret_coverage(group.surface, group.force, previous_position, waypoint)
+    if #find_covering_turrets(group.surface, group.force, waypoint) == 0 and not path_covered then
       safe_waypoints[#safe_waypoints + 1] = waypoint
+      previous_position = waypoint
     end
   end
 
@@ -1432,11 +2030,32 @@ local function filter_safe_flank_waypoints(group, waypoints, preferred_position)
     return {}
   end
 
-  if preferred_position and distance_sq(safe_waypoints[#safe_waypoints], preferred_position) > 1 then
+  if preferred_position
+    and distance_sq(safe_waypoints[#safe_waypoints], preferred_position) > 1
+    and #find_covering_turrets(group.surface, group.force, preferred_position) == 0
+    and not path_has_turret_coverage(group.surface, group.force, safe_waypoints[#safe_waypoints], preferred_position) then
     safe_waypoints[#safe_waypoints + 1] = copy_position(preferred_position)
   end
 
   return safe_waypoints
+end
+
+function runtime_ext.choose_safe_flank_route(group, route_sets, preferred_position)
+  local best_route = {}
+  local best_score
+
+  for route_index = 1, #route_sets do
+    local candidate_route = filter_safe_flank_waypoints(group, route_sets[route_index], preferred_position)
+    if #candidate_route > 0 then
+      local score = distance_sq(group.position, candidate_route[1])
+      if not best_score or score < best_score then
+        best_route = candidate_route
+        best_score = score
+      end
+    end
+  end
+
+  return best_route
 end
 
 local function determine_breach_axis(analysis, candidate)
@@ -1736,7 +2355,7 @@ local function find_staging_positions(group, candidate, analysis)
       candidate.position,
       preferred_samples,
       analysis.probe_unit_name,
-      2,
+      SUPPORT_STANDOFF_MIN_DISTANCE,
       math.max(2, math.floor(ranged_range - 0.5)),
       ranged_range - 0.5
     )
@@ -1787,6 +2406,10 @@ local function find_staging_positions(group, candidate, analysis)
           or (preferred_side and "no-safe-same-side-standoff" or "no-safe-standoff")
       end
     end
+  end
+
+  if support_mode == "cone-siege" and support_position and #find_covering_turrets(group.surface, group.force, rally_position) > 0 then
+    rally_position = copy_position(support_position)
   end
 
   return rally_position, support_position, ranged_members, ranged_range, candidate.outside_direction, support_rejection_reason, support_mode, cone_lane_positions
@@ -1840,26 +2463,39 @@ function runtime_ext.build_support_cone_positions(surface, target_position, anch
   if not allow_out_of_range then
     base_distance = math.min(base_distance, ranged_range - 0.75)
   end
-  local lane_positions = {}
-  local seen = {}
 
-  for lane_offset = -2, 2 do
-    local candidate = {
-      x = target_position.x + direction_x * base_distance + perpendicular_x * lane_offset * RANGED_CONE_LANE_SPREAD,
-      y = target_position.y + direction_y * base_distance + perpendicular_y * lane_offset * RANGED_CONE_LANE_SPREAD
-    }
-    candidate = find_walkable_position_near(surface, candidate, probe_unit_name, 2)
-    local lane_is_valid = allow_out_of_range or distance_sq(candidate, target_position) <= (ranged_range - 0.25) * (ranged_range - 0.25)
-    if lane_is_valid and (not allow_out_of_range or #find_covering_turrets(surface, game.forces.enemy, candidate) == 0) then
-      local lane_key = position_key(candidate)
-      if not seen[lane_key] then
-        lane_positions[#lane_positions + 1] = candidate
-        seen[lane_key] = true
+  local best_lane_positions = {}
+  for distance_step = 0, (allow_out_of_range and 8 or 0) do
+    local lane_positions = {}
+    local seen = {}
+    local lane_distance = base_distance + distance_step
+
+    for lane_offset = -2, 2 do
+      local candidate = {
+        x = target_position.x + direction_x * lane_distance + perpendicular_x * lane_offset * RANGED_CONE_LANE_SPREAD,
+        y = target_position.y + direction_y * lane_distance + perpendicular_y * lane_offset * RANGED_CONE_LANE_SPREAD
+      }
+      candidate = find_walkable_position_near(surface, candidate, probe_unit_name, 2)
+      local lane_is_valid = allow_out_of_range or distance_sq(candidate, target_position) <= (ranged_range - 0.25) * (ranged_range - 0.25)
+      if lane_is_valid and #find_covering_turrets(surface, game.forces.enemy, candidate) == 0 then
+        local lane_key = position_key(candidate)
+        if not seen[lane_key] then
+          lane_positions[#lane_positions + 1] = candidate
+          seen[lane_key] = true
+        end
       end
+    end
+
+    if #lane_positions > #best_lane_positions then
+      best_lane_positions = lane_positions
+    end
+
+    if #lane_positions >= 3 or (not allow_out_of_range and #lane_positions > 0) then
+      return lane_positions
     end
   end
 
-  return lane_positions
+  return best_lane_positions
 end
 
 function runtime_ext.get_cone_lane_indices(split_count)
@@ -1939,6 +2575,33 @@ local function get_site_entry_vector(site)
   return breach_center, direction_x, direction_y
 end
 
+function runtime_ext.get_breach_entry_progress(site, position)
+  if not (site and position) then
+    return nil, nil, nil
+  end
+
+  local breach_center, direction_x, direction_y = get_site_entry_vector(site)
+  local perpendicular_x = -direction_y
+  local perpendicular_y = direction_x
+  local delta_x = position.x - breach_center.x
+  local delta_y = position.y - breach_center.y
+  local progress = delta_x * direction_x + delta_y * direction_y
+  local lateral = math.abs(delta_x * perpendicular_x + delta_y * perpendicular_y)
+  local lateral_limit = 2
+
+  for index = 1, #(site.breach_positions or {}) do
+    local breach_position = site.breach_positions[index]
+    local breach_delta_x = breach_position.x - breach_center.x
+    local breach_delta_y = breach_position.y - breach_center.y
+    local breach_lateral = math.abs(breach_delta_x * perpendicular_x + breach_delta_y * perpendicular_y)
+    if breach_lateral > lateral_limit then
+      lateral_limit = breach_lateral
+    end
+  end
+
+  return progress, lateral, lateral_limit + 2
+end
+
 local function update_site_entry_positions(site, surface)
   normalize_site(site)
   local breach_center, direction_x, direction_y = get_site_entry_vector(site)
@@ -1965,6 +2628,14 @@ local function update_site_entry_positions(site, surface)
     exploit_position = find_walkable_position_near(surface, exploit_position, probe_unit_name, 5)
   end
 
+  if site.seeded_inside_rally_position then
+    inside_rally_position = copy_position(site.seeded_inside_rally_position)
+  end
+
+  if site.seeded_exploit_position then
+    exploit_position = copy_position(site.seeded_exploit_position)
+  end
+
   site.entry_position = entry_position
   site.inside_rally_position = inside_rally_position
   site.exploit_position = exploit_position
@@ -1982,7 +2653,7 @@ local function update_site_entry_positions(site, surface)
   return breach_center, direction_x, direction_y
 end
 
-local function sample_line_positions(from_position, to_position, sample_count)
+sample_line_positions = function(from_position, to_position, sample_count)
   local samples = {}
   local steps = math.max(1, sample_count)
 
@@ -2222,12 +2893,7 @@ local function build_flame_lane_positions(site, target, surface)
   local direction_x, direction_y = normalized_direction(entry_position, target.position)
   local perpendicular_x = -direction_y
   local perpendicular_y = direction_x
-  local distance_to_target = math.sqrt(distance_sq(entry_position, target.position))
-  local staging_distance = math.max(target.range + 1.5, math.min(distance_to_target - 1, target.range + 3))
-  local anchor = {
-    x = target.position.x - direction_x * staging_distance,
-    y = target.position.y - direction_y * staging_distance
-  }
+  local base_staging_distance = target.range + CONE_STAGING_SAFETY_BUFFER + 3
   local probe_unit_name = site.probe_unit_name or UNIT_PROBE_FALLBACK
   local lane_positions = {}
   local offsets = {
@@ -2238,11 +2904,25 @@ local function build_flame_lane_positions(site, target, surface)
 
   for index = 1, #offsets do
     local offset = offsets[index]
-    local lane_position = {
-      x = anchor.x + perpendicular_x * offset,
-      y = anchor.y + perpendicular_y * offset
-    }
-    lane_positions[index] = find_walkable_position_near(surface, lane_position, probe_unit_name, 2)
+    local chosen_position
+    for distance_step = 0, 6 do
+      local staging_distance = base_staging_distance + distance_step
+      local anchor = {
+        x = target.position.x - direction_x * staging_distance,
+        y = target.position.y - direction_y * staging_distance
+      }
+      local lane_position = {
+        x = anchor.x + perpendicular_x * offset,
+        y = anchor.y + perpendicular_y * offset
+      }
+      lane_position = find_walkable_position_near(surface, lane_position, probe_unit_name, 2)
+      if #find_covering_turrets(surface, game.forces.enemy, lane_position) == 0 then
+        chosen_position = lane_position
+        break
+      end
+      chosen_position = chosen_position or lane_position
+    end
+    lane_positions[index] = chosen_position
   end
 
   return lane_positions
@@ -2277,6 +2957,8 @@ local function choose_flame_lane(record, site, target, surface)
 
   for index = 1, #lane_positions do
     local hazard_score, hazards = get_fire_entities_near(surface, lane_positions[index])
+    local cover_count = #find_covering_turrets(surface, game.forces.enemy, lane_positions[index])
+    hazard_score = hazard_score + cover_count * 1000
     if index == current_lane then
       current_score = hazard_score
     end
@@ -2308,6 +2990,7 @@ end
 local function begin_command(record, kind, target_position, radius, timeout)
   record.activated_tick = record.activated_tick or game.tick
   record.command_kind = kind
+  record.command_distraction = record.pending_command_distraction or defines.distraction.none
   record.command_status = "active"
   record.command_result = defines.behavior_result.in_progress
   record.command_target_position = target_position and copy_position(target_position) or nil
@@ -2317,8 +3000,9 @@ local function begin_command(record, kind, target_position, radius, timeout)
   record.command_completed_tick = nil
 end
 
-local function clear_command(record)
+clear_command = function(record)
   record.command_kind = nil
+  record.command_distraction = nil
   record.command_status = nil
   record.command_result = nil
   record.command_target_position = nil
@@ -2326,6 +3010,10 @@ local function clear_command(record)
   record.command_issued_tick = nil
   record.command_timeout = nil
   record.command_completed_tick = nil
+end
+
+local function get_script_attack_distraction(_record)
+  return defines.distraction.none
 end
 
 local function mark_command_complete(record, result, tick)
@@ -2351,6 +3039,17 @@ local function command_finished(record, group)
       mark_command_complete(record, defines.behavior_result.success, game.tick)
       return true
     end
+  end
+
+  if record.command_kind == "move"
+    and group.is_unit_group
+    and group.state == defines.group_state.gathering
+    and record.command_target_position
+    and distance_sq(group.position, record.command_target_position) > (record.command_radius or 3) * (record.command_radius or 3) then
+    if game.tick - record.command_issued_tick >= PROCESS_INTERVAL then
+      group.start_moving()
+    end
+    return false
   end
 
   if not group.has_command and game.tick - record.command_issued_tick >= PROCESS_INTERVAL then
@@ -2582,6 +3281,7 @@ local function find_attack_target(surface, position, defense_force_name)
 end
 
 local function issue_move(record, group, position, radius)
+  record.pending_command_distraction = defines.distraction.none
   group.set_command({
     type = defines.command.go_to_location,
     destination = position,
@@ -2594,23 +3294,98 @@ local function issue_move(record, group, position, radius)
   end
 
   begin_command(record, "move", position, radius or 3, MOVE_COMMAND_TIMEOUT)
+  record.pending_command_distraction = nil
+end
+
+local function issue_safe_move(record, group, position, radius, reason)
+  if prebreach_safety_required(record) then
+    local covering_turrets = find_covering_turrets(group.surface, group.force, position)
+    if #covering_turrets > 0 then
+      emit_coverage_violation(record, position, reason or "covered-destination", covering_turrets)
+      return false
+    end
+
+    local path_covered, path_sources = path_has_turret_coverage(group.surface, group.force, group.position, position)
+    if path_covered then
+      emit_coverage_violation(record, position, reason or "covered-path", path_sources)
+      return false
+    end
+  end
+
+  issue_move(record, group, position, radius)
+  return true
+end
+
+local function reassert_move_command(record, group, position, radius, reason, use_safe_move)
+  if not (record and group and record.command_kind == "move" and record.command_status == "active" and record.command_target_position) then
+    return false
+  end
+
+  local completion_radius = radius or record.command_radius or 3
+  if distance_sq(group.position, record.command_target_position) <= completion_radius * completion_radius then
+    return false
+  end
+
+  if game.tick - (record.command_issued_tick or game.tick) < MOVE_REASSERT_TICKS then
+    return false
+  end
+
+  record_debug_event("command_reasserted", record, {
+    reason = reason or "move-stuck",
+    target_position = position or record.command_target_position,
+    command_kind = record.command_kind,
+    command_distraction = record.command_distraction,
+    command_target_position = record.command_target_position,
+    script_command_preserved = true
+  })
+
+  if group.is_unit_group and group.state == defines.group_state.gathering then
+    group.start_moving()
+    record.command_issued_tick = game.tick
+    return true
+  end
+
+  clear_command(record)
+  if use_safe_move then
+    return issue_safe_move(record, group, position or record.command_target_position, completion_radius, reason)
+  end
+
+  issue_move(record, group, position or record.command_target_position, completion_radius)
+  return true
 end
 
 local function issue_attack(record, group, target_position, defense_force_name)
   local target_entity = find_attack_target(group.surface, target_position, defense_force_name)
+  local distraction = get_script_attack_distraction(record)
+
+  if record.entry_open then
+    local wall_target = target_entity
+    if not (wall_target and wall_target.valid and (wall_target.type == "wall" or wall_target.type == "gate")) then
+      wall_target = find_wall_entity_at(group.surface, defense_force_name, target_position)
+    end
+    if wall_target and wall_target.valid and (wall_target.type == "wall" or wall_target.type == "gate") then
+      record_debug_event("wall_target_after_breach", record, {
+        reason = "post-breach-wall-target",
+        target_position = wall_target.position,
+        target_turret_name = wall_target.name,
+        target_turret_position = wall_target.position,
+        entry_open = true
+      })
+    end
+  end
 
   if target_entity then
     group.set_command({
       type = defines.command.attack,
       target = target_entity,
-      distraction = defines.distraction.by_enemy
+      distraction = distraction
     })
   else
     group.set_command({
       type = defines.command.attack_area,
       destination = target_position,
       radius = ATTACK_RADIUS,
-      distraction = defines.distraction.by_enemy
+      distraction = distraction
     })
   end
 
@@ -2618,7 +3393,9 @@ local function issue_attack(record, group, target_position, defense_force_name)
     group.start_moving()
   end
 
+  record.pending_command_distraction = distraction
   begin_command(record, "attack", target_position, ATTACK_RADIUS, ATTACK_COMMAND_TIMEOUT)
+  record.pending_command_distraction = nil
 end
 
 local function issue_attack_entity(record, group, target_entity)
@@ -2629,18 +3406,31 @@ local function issue_attack_entity(record, group, target_entity)
   record.target_position = copy_position(target_entity.position)
   record.target_turret_position = copy_position(target_entity.position)
   record.target_turret_name = target_entity.name
+  local distraction = get_script_attack_distraction(record)
+
+  if record.entry_open and (target_entity.type == "wall" or target_entity.type == "gate") then
+    record_debug_event("wall_target_after_breach", record, {
+      reason = "post-breach-wall-target",
+      target_position = target_entity.position,
+      target_turret_name = target_entity.name,
+      target_turret_position = target_entity.position,
+      entry_open = true
+    })
+  end
 
   group.set_command({
     type = defines.command.attack,
     target = target_entity,
-    distraction = defines.distraction.by_enemy
+    distraction = distraction
   })
 
   if group.is_unit_group then
     group.start_moving()
   end
 
+  record.pending_command_distraction = distraction
   begin_command(record, "attack", target_entity.position, ATTACK_RADIUS, ATTACK_COMMAND_TIMEOUT)
+  record.pending_command_distraction = nil
   return true
 end
 
@@ -2778,6 +3568,7 @@ local function update_breach_progress(record, surface)
   )
 
   if record.breach_open_segments ~= open_segments then
+    note_meaningful_progress(record)
     record_debug_event("breach_progress_updated", record, {
       reason = open_segments > (record.breach_open_segments or 0) and "segment-opened" or "segment-regressed",
       breach_open_segments = open_segments,
@@ -3050,17 +3841,56 @@ ensure_entry_traversed = function(record, group, site)
   end
 
   update_site_entry_positions(site, group.surface)
-  local destination = site.inside_rally_position or site.entry_position
+  local breach_center, direction_x, direction_y = get_site_entry_vector(site)
+  local destination = site.inside_rally_position or site.entry_position or breach_center
   if not destination then
     return false
   end
+
+  local outside_approach = {
+    x = breach_center.x - direction_x * BREACH_ENTRY_DISTANCE,
+    y = breach_center.y - direction_y * BREACH_ENTRY_DISTANCE
+  }
+  outside_approach = find_walkable_position_near(group.surface, outside_approach, get_group_probe_unit_name(group), 3)
 
   record.entry_open = true
   record.site_entry_position = copy_position(site.entry_position)
   record.inside_rally_position = copy_position(site.inside_rally_position)
   record.exploit_position = copy_position(site.exploit_position)
 
-  if distance_sq(group.position, destination) <= POST_BREACH_ENTRY_RADIUS * POST_BREACH_ENTRY_RADIUS then
+  local progress, lateral, lateral_limit = runtime_ext.get_breach_entry_progress(site, group.position)
+  record.entry_progress = progress
+  local stage = "approach"
+  local move_destination = outside_approach
+
+  if progress and lateral and lateral_limit then
+    if lateral > lateral_limit or progress < -0.5 then
+      stage = "approach"
+      move_destination = outside_approach
+    elseif progress < 0.5 then
+      stage = "breach-center"
+      move_destination = breach_center
+    elseif progress < (BREACH_ENTRY_DISTANCE - 0.5) and site.entry_position then
+      stage = "entry"
+      move_destination = site.entry_position
+    else
+      stage = "inside"
+      move_destination = destination
+    end
+  end
+
+  if record.entry_progress_stage ~= stage then
+    record.entry_progress_stage = stage
+    record_debug_event("entry_progress_updated", record, {
+      reason = stage,
+      target_position = move_destination,
+      entry_progress = progress,
+      entry_open = true
+    })
+    note_meaningful_progress(record, group.position)
+  end
+
+  if stage == "inside" and distance_sq(group.position, destination) <= POST_BREACH_ENTRY_RADIUS * POST_BREACH_ENTRY_RADIUS then
     return false
   end
 
@@ -3068,8 +3898,11 @@ ensure_entry_traversed = function(record, group, site)
     clear_command(record)
   end
 
-  if not record.command_status or record.command_kind ~= "move" then
-    issue_move(record, group, destination, POST_BREACH_ENTRY_RADIUS)
+  if not record.command_status
+    or record.command_kind ~= "move"
+    or not record.command_target_position
+    or distance_sq(record.command_target_position, move_destination) > 1 then
+    issue_move(record, group, move_destination, POST_BREACH_ENTRY_RADIUS)
   end
 
   return true
@@ -3178,18 +4011,19 @@ local function issue_support_breach_attack(record, group)
     end
 
     if distance_sq(group.position, lane_positions[lane_index]) > SUPPORT_RETURN_RADIUS * SUPPORT_RETURN_RADIUS then
-      issue_move(record, group, lane_positions[lane_index], SUPPORT_RETURN_RADIUS)
+      issue_safe_move(record, group, lane_positions[lane_index], SUPPORT_RETURN_RADIUS, "cone-lane-covered")
       return true
     end
   elseif record.support_position and distance_sq(group.position, record.support_position) > SUPPORT_RETURN_RADIUS * SUPPORT_RETURN_RADIUS then
-    issue_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS)
+    issue_safe_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS, "support-position-covered")
     return true
   end
 
+  note_meaningful_progress(record, group.position)
   return issue_attack_entity(record, group, target_entity)
 end
 
-local function start_fallback_attack(record, group, reason)
+start_fallback_attack = function(record, group, reason)
   local target_position = record.target_position
   local defense_force_name = record.target_force_name
 
@@ -3237,7 +4071,7 @@ local function attach_support_group(record, site, ranged_members)
   record.support_spawned = true
 
   local support_group = record.group.surface.create_unit_group({
-    position = record.group.position,
+    position = site.support_position or record.group.position,
     force = record.group.force
   })
 
@@ -3300,7 +4134,12 @@ function runtime_ext.attach_cone_support_groups(record, site, ranged_members)
     local member_count = math.ceil(#ranged_members / remaining_groups)
     local allocated_members = allocate_members(ranged_members, member_count)
     local lane_index = math.min(lane_indices[split_index] or math.ceil(#lane_positions / 2), #lane_positions)
-    local split_group, moved_members = create_split_group(record.group.surface, record.group.force, record.group.position, allocated_members)
+    local split_group, moved_members = create_split_group(
+      record.group.surface,
+      record.group.force,
+      lane_positions[lane_index] or record.group.position,
+      allocated_members
+    )
     moved_members = moved_members or 0
 
     if split_group and moved_members > 0 then
@@ -3416,6 +4255,17 @@ local function begin_siege(record, group, site)
     return
   end
 
+  if record.waiting_for_breach then
+    local remaining_ranged_members, remaining_ranged_range = get_group_ranged_members(group)
+    local current_cover = find_covering_turrets(group.surface, group.force, group.position)
+    if #remaining_ranged_members == 0
+      and remaining_ranged_range <= 1.5
+      and #current_cover == 0 then
+      record.rally_position = copy_position(group.position)
+      site.rally_position = copy_position(group.position)
+    end
+  end
+
   if reusable_entry and site.inside_rally_position then
     local reuse_event_name = ((site.wave_count or 0) > 1) and "breach_reused" or "open_entry_taken"
     record_debug_event("siege_site_selected", record, {
@@ -3464,10 +4314,10 @@ local function begin_siege(record, group, site)
     breach_required_segments = record.breach_required_segments,
     breach_open_segments = record.breach_open_segments
   })
-  issue_move(record, group, record.rally_position, 3)
+  issue_safe_move(record, group, record.rally_position, 3, "siege-rally-covered")
 end
 
-local function apply_site_to_record(record, site)
+function apply_site_to_record(record, site)
   normalize_site(site)
   record.siege_site_id = site.key
   record.approach_side = site.approach_side
@@ -3482,7 +4332,7 @@ local function apply_site_to_record(record, site)
   record.entry_open = site.entry_open
 end
 
-local function find_support_follow_target(site, surface)
+function find_support_follow_target(site, surface)
   if site.active_flame_turrets and #site.active_flame_turrets > 0 then
     return nil, nil
   end
@@ -3506,7 +4356,7 @@ local function find_support_follow_target(site, surface)
   return nil, nil
 end
 
-local function find_support_follow_position(group, site, turret)
+function find_support_follow_position(group, site, turret)
   local _, ranged_range = get_group_ranged_members(group)
   if ranged_range <= 1.5 then
     return nil
@@ -3546,7 +4396,7 @@ local function find_support_follow_position(group, site, turret)
   return best_position
 end
 
-local function handle_post_breach_planning(record, group)
+function handle_post_breach_planning(record, group)
   local site = get_site_for_record(record)
   if not site then
     set_group_autonomous(group)
@@ -3563,12 +4413,36 @@ local function handle_post_breach_planning(record, group)
     clear_command(record)
   end
 
-  if ensure_entry_traversed(record, group, site) then
+  if #targets == 0 then
+    issue_breach_exploit(record, group, site, "no-local-turrets")
     return
   end
 
-  if #targets == 0 then
-    issue_breach_exploit(record, group, site, "no-local-turrets")
+  local focus_target = targets[1]
+  if focus_target then
+    record.target_position = copy_position(focus_target.position)
+    record.target_turret_name = focus_target.name
+    record.target_turret_position = copy_position(focus_target.position)
+    record_debug_event("interior_target_selected", record, {
+      reason = focus_target.is_flame and "flame-turret" or "combat-turret",
+      target_turret_name = focus_target.name,
+      target_turret_position = focus_target.position,
+      target_position = focus_target.position,
+      siege_site_id = site.key,
+      entry_open = true
+    })
+  end
+
+  if ensure_entry_traversed(record, group, site) then
+    local stalled_entry = record.state_since_tick
+      and game.tick - record.state_since_tick >= POST_BREACH_ASSAULT_HANDOFF_TICKS
+    if stalled_entry and focus_target then
+      clear_command(record)
+      record.role = "assault"
+      remove_id_from_list(site.reserve_group_ids, record.id)
+      append_unique_id(site.assault_group_ids, record.id)
+      assign_next_assault_target(record, group, site)
+    end
     return
   end
 
@@ -3582,7 +4456,7 @@ local function handle_post_breach_planning(record, group)
   mark_reserve_record(record, group, site)
 end
 
-local function handle_assault_state(record, group)
+function handle_assault_state(record, group)
   local site = get_site_for_record(record)
   if not site then
     set_group_autonomous(group)
@@ -3652,7 +4526,7 @@ local function handle_assault_state(record, group)
   end
 end
 
-local function handle_support_following(record, group)
+function handle_support_following(record, group)
   local site = get_site_for_record(record)
   if not site then
     set_group_autonomous(group)
@@ -3665,7 +4539,9 @@ local function handle_support_following(record, group)
   site.expires_tick = game.tick + SIEGE_SITE_TTL
   local targets = collect_local_assault_targets(group.surface, site)
   if #targets == 0 then
-    issue_breach_exploit(record, group, site, "support-exploit")
+    clear_command(record)
+    set_group_autonomous(group)
+    remove_group_record(record.id, false, "support-exploit-complete")
     return
   end
 
@@ -3730,7 +4606,7 @@ local function handle_support_following(record, group)
   end
 end
 
-local function handle_support_group(record, group)
+function handle_support_group(record, group)
   if count_group_members(group) == 0 then
     remove_group_record(record.id, false, "support-empty")
     return
@@ -3743,43 +4619,82 @@ local function handle_support_group(record, group)
 
   if record.state == "support-moving" then
     if command_finished(record, group) then
+      local move_failed = record.command_kind == "move"
+        and record.support_position
+        and distance_sq(group.position, record.support_position) > SUPPORT_RETURN_RADIUS * SUPPORT_RETURN_RADIUS
       clear_command(record)
+      if move_failed then
+        record_debug_event("command_reasserted", record, {
+          reason = "support-moving-command-failed",
+          target_position = record.support_position,
+          command_kind = "move",
+          command_distraction = defines.distraction.none,
+          command_target_position = record.support_position,
+          script_command_preserved = false
+        })
+        issue_safe_move(record, group, record.support_position, 3, "support-moving-covered")
+        return
+      end
+
       local site = get_site_for_record(record)
       if site and runtime_ext.site_has_reusable_entry(site, group.surface) then
         record.entry_open = true
         record.state = "support-following"
       else
         record.state = "support-sieging"
+        note_meaningful_progress(record, group.position)
         if not issue_support_breach_attack(record, group) then
           set_group_autonomous(group)
           remove_group_record(record.id, false, "support-no-breach-target")
         end
       end
     elseif not record.command_status then
-      issue_move(record, group, record.support_position, 3)
+      issue_safe_move(record, group, record.support_position, 3, "support-moving-covered")
+    elseif reassert_move_command(record, group, record.support_position, 3, "support-moving-stuck", true) then
+      return
     end
     return
   end
 
   if record.state == "support-resetting" then
     if command_finished(record, group) then
+      local move_failed = record.command_kind == "move"
+        and record.support_position
+        and distance_sq(group.position, record.support_position) > SUPPORT_RETURN_RADIUS * SUPPORT_RETURN_RADIUS
       clear_command(record)
+      if move_failed then
+        record_debug_event("command_reasserted", record, {
+          reason = "support-reset-command-failed",
+          target_position = record.support_position,
+          command_kind = "move",
+          command_distraction = defines.distraction.none,
+          command_target_position = record.support_position,
+          script_command_preserved = false
+        })
+        issue_safe_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS, "support-reset-covered")
+        return
+      end
+
       record.state = "support-sieging"
+      note_meaningful_progress(record, group.position)
     elseif not record.command_status then
-      issue_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS)
+      issue_safe_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS, "support-reset-covered")
+    elseif reassert_move_command(record, group, record.support_position, SUPPORT_RETURN_RADIUS, "support-resetting-stuck", true) then
+      return
     end
     return
   end
 
   if record.state == "support-sieging" then
     local breach_open, open_segments = update_breach_progress(record, group.surface)
+    local site = get_site_for_record(record)
     if breach_open then
       clear_command(record)
-      local site = get_site_for_record(record)
       if site then
         site.entry_open = true
         record.entry_open = true
         record.state = "support-following"
+        note_meaningful_progress(record, group.position)
       else
         set_group_autonomous(group)
         remove_group_record(record.id, false, "support-breach-open")
@@ -3795,8 +4710,19 @@ local function handle_support_group(record, group)
     if drifting or exposed then
       clear_command(record)
       record.state = "support-resetting"
-      issue_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS)
+      note_meaningful_progress(record, group.position)
+      issue_safe_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS, drifting and "support-drift-covered" or "support-exposed")
       return
+    end
+
+    local last_pressure_tick = site and site.last_breach_pressure_tick or record.last_meaningful_progress_tick or game.tick
+    if site and open_segments == 0 and game.tick - last_pressure_tick > BREACH_PRESSURE_TIMEOUT and record.last_breach_pressure_lost_tick ~= game.tick then
+      record.last_breach_pressure_lost_tick = game.tick
+      record_debug_event("breach_pressure_lost", record, {
+        reason = "support-sieging-timeout",
+        support_mode = record.support_mode,
+        breach_pressure_active = false
+      })
     end
 
     if command_finished(record, group) then
@@ -3832,7 +4758,7 @@ local function handle_support_group(record, group)
   end
 end
 
-local function handle_flank_state(record, group)
+function handle_flank_state(record, group)
   if command_finished(record, group) then
     local command_failed = record.command_result == defines.behavior_result.fail
       or record.command_result == defines.behavior_result.deleted
@@ -3853,13 +4779,39 @@ local function handle_flank_state(record, group)
       issue_move(record, group, record.flank_waypoints[record.flank_index], 2)
     end
   elseif not record.command_status and record.flank_waypoints and record.flank_index then
-    issue_move(record, group, record.flank_waypoints[record.flank_index], 2)
+    issue_safe_move(record, group, record.flank_waypoints[record.flank_index], 2, "flank-waypoint-covered")
   end
 end
 
-local function handle_rally_state(record, group)
-  if command_finished(record, group) then
+function handle_rally_state(record, group)
+  if record.waiting_for_breach
+    and record.rally_position
+    and distance_sq(group.position, record.rally_position) <= 9 then
     clear_command(record)
+    record.state = "breach-waiting"
+    record.breach_wait_started_tick = record.breach_wait_started_tick or game.tick
+    note_meaningful_progress(record, group.position)
+    return
+  end
+
+  if command_finished(record, group) then
+    local move_failed = record.command_kind == "move"
+      and record.rally_position
+      and distance_sq(group.position, record.rally_position) > 9
+    clear_command(record)
+    if move_failed then
+      record_debug_event("command_reasserted", record, {
+        reason = "rally-command-failed",
+        target_position = record.rally_position,
+        command_kind = "move",
+        command_distraction = defines.distraction.none,
+        command_target_position = record.rally_position,
+        script_command_preserved = false
+      })
+      issue_safe_move(record, group, record.rally_position, 3, "rally-covered")
+      return
+    end
+
     if record.waiting_for_breach then
       record.state = "breach-waiting"
     else
@@ -3867,11 +4819,23 @@ local function handle_rally_state(record, group)
       issue_attack(record, group, record.target_position, record.target_force_name)
     end
   elseif not record.command_status then
-    issue_move(record, group, record.rally_position, 3)
+    if record.command_kind and record.command_kind ~= "move" then
+      record_debug_event("command_reasserted", record, {
+        reason = "rally-safe-move",
+        target_position = record.rally_position,
+        command_kind = record.command_kind,
+        command_distraction = record.command_distraction,
+        command_target_position = record.command_target_position,
+        script_command_preserved = false
+      })
+    end
+    issue_safe_move(record, group, record.rally_position, 3, "rally-covered")
+  elseif reassert_move_command(record, group, record.rally_position, 3, "rally-move-stuck", true) then
+    return
   end
 end
 
-local function handle_breach_wait_state(record, group)
+function handle_breach_wait_state(record, group)
   local breach_open = update_breach_progress(record, group.surface)
   local exposed = #find_covering_turrets(group.surface, group.force, group.position) > 0
   local site = get_site_for_record(record)
@@ -3897,12 +4861,24 @@ local function handle_breach_wait_state(record, group)
   if site and not record.breach_replan_used then
     local last_pressure_tick = site.last_breach_pressure_tick or record.breach_wait_started_tick or record.activated_tick or game.tick
     if game.tick - last_pressure_tick > BREACH_PRESSURE_TIMEOUT and site.support_mode == "safe-standoff" and site.cone_lane_positions and #site.cone_lane_positions > 0 then
+      record.last_breach_pressure_lost_tick = game.tick
+      record_debug_event("breach_pressure_lost", record, {
+        reason = "safe-standoff-timeout",
+        support_mode = site.support_mode,
+        breach_pressure_active = false
+      })
       record.breach_replan_used = true
       record.replans = record.replans + 1
       site.support_mode = "cone-siege"
       site.support_position = copy_position(site.cone_lane_positions[math.ceil(#site.cone_lane_positions / 2)])
       runtime_ext.release_child_support_groups(record.id, "support-mode-replan")
       clear_command(record)
+      record_debug_event("support_mode_replanned", record, {
+        reason = "breach-pressure-timeout",
+        support_mode = site.support_mode,
+        target_position = site.support_position
+      })
+      note_meaningful_progress(record, group.position)
       begin_siege(record, group, site)
       return
     end
@@ -3912,16 +4888,26 @@ local function handle_breach_wait_state(record, group)
     if command_finished(record, group) then
       clear_command(record)
     elseif exposed and record.command_kind ~= "move" then
+      record_debug_event("command_reasserted", record, {
+        reason = "breach-wait-safe-move",
+        target_position = record.rally_position,
+        command_kind = record.command_kind,
+        command_distraction = record.command_distraction,
+        command_target_position = record.command_target_position,
+        script_command_preserved = false
+      })
       clear_command(record)
     end
 
     if not record.command_status or record.command_kind ~= "move" then
-      issue_move(record, group, record.rally_position, 3)
+      issue_safe_move(record, group, record.rally_position, 3, "breach-wait-covered")
+    elseif reassert_move_command(record, group, record.rally_position, 3, "breach-wait-move-stuck", true) then
+      return
     end
   end
 end
 
-local function handle_attack_state(record, group)
+function handle_attack_state(record, group)
   if record.siege_site_id and record.breach_positions then
     local breach_open = update_breach_progress(record, group.surface)
     if breach_open and start_post_breach_planning(record, group, "attack-breach-open") then
@@ -3952,7 +4938,7 @@ local function handle_attack_state(record, group)
   end
 end
 
-local function handle_breach_exploiting_state(record, group)
+function handle_breach_exploiting_state(record, group)
   local site = get_site_for_record(record)
   if command_finished(record, group) then
     local previous_command_kind = record.command_kind
@@ -3968,7 +4954,7 @@ local function handle_breach_exploiting_state(record, group)
   end
 end
 
-local function update_record_analysis(record, analysis, reference_position, selected_candidate)
+function update_record_analysis(record, analysis, reference_position, selected_candidate)
   local selected_key = selected_candidate and selected_candidate.key or nil
   record.debug_candidates, record.debug_selected_candidate_index = build_debug_candidates(analysis, reference_position, selected_key)
   record.debug_analysis = {
@@ -3979,7 +4965,86 @@ local function update_record_analysis(record, analysis, reference_position, sele
   }
 end
 
-local function plan_group_action(record, group)
+local function site_rally_is_safe(group, site)
+  if not (group and site and site.rally_position) then
+    return false, "missing-rally-position"
+  end
+
+  local covering_turrets = find_covering_turrets(group.surface, group.force, site.rally_position)
+  if #covering_turrets > 0 then
+    return false, "siege-rally-covered"
+  end
+
+  local path_covered = path_has_turret_coverage(group.surface, group.force, group.position, site.rally_position)
+  if path_covered then
+    return false, "siege-rally-path-covered"
+  end
+
+  return true, nil
+end
+
+local function try_activate_flank_route(record, group, flank_waypoints, best_candidate, reason)
+  if not (flank_waypoints and #flank_waypoints > 0 and best_candidate and best_candidate.entity and best_candidate.entity.valid) then
+    return false
+  end
+
+  record.replans = record.replans + 1
+  record.target_position = copy_position(best_candidate.position)
+  record.target_force_name = best_candidate.entity.force.name
+  record.flank_waypoints = flank_waypoints
+  record.flank_index = 1
+  record.state = "flanking"
+
+  if reason then
+    record_debug_event("unsafe_rally_replanned", record, {
+      reason = reason,
+      target_position = flank_waypoints[1],
+      selected_candidate_index = record.debug_selected_candidate_index,
+      command_kind = record.command_kind,
+      command_distraction = record.command_distraction,
+      command_target_position = record.command_target_position
+    })
+  end
+
+  record_debug_event("flank_waypoint_set", record, {
+    reason = reason or "better-flank",
+    target_position = flank_waypoints[1],
+    selected_candidate_index = record.debug_selected_candidate_index
+  })
+
+  if not issue_safe_move(record, group, flank_waypoints[1], 2, "flank-waypoint-covered") then
+    record.state = "tracking"
+    record.flank_waypoints = nil
+    record.flank_index = nil
+    return false
+  end
+
+  return true
+end
+
+local function try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, site)
+  if not (site and site.support_mode == "none" and current_candidate and best_candidate and record.replans < MAX_REPLANS) then
+    return false
+  end
+
+  local rally_safe, unsafe_reason = site_rally_is_safe(group, site)
+  if rally_safe then
+    return false
+  end
+
+  local flank_waypoints = runtime_ext.choose_safe_flank_route(
+    group,
+    runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate),
+    best_candidate.outside_position
+  )
+  if #flank_waypoints == 0 then
+    return false
+  end
+
+  return try_activate_flank_route(record, group, flank_waypoints, best_candidate, unsafe_reason)
+end
+
+function plan_group_action(record, group)
   local siege_site = find_nearby_siege_site(group)
   if siege_site then
     begin_siege(record, group, siege_site)
@@ -4056,16 +5121,6 @@ local function plan_group_action(record, group)
     return
   end
 
-  local _, ranged_range = get_group_ranged_members(group)
-  if best_candidate and best_candidate.cover_count > 0 and ranged_range > 1.5 then
-    local _, support_position = find_staging_positions(group, best_candidate, analysis)
-    if support_position then
-      local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
-      begin_siege(record, group, siege_site_record)
-      return
-    end
-  end
-
   if current_candidate
     and best_candidate
     and compare_candidate_priority(best_candidate, current_candidate)
@@ -4075,24 +5130,39 @@ local function plan_group_action(record, group)
       build_flank_waypoints(analysis, current_candidate, best_candidate),
       best_candidate.outside_position
     )
+    if #flank_waypoints == 0 and current_candidate.cover_count > 0 and best_candidate.cover_count == 0 then
+      flank_waypoints = runtime_ext.choose_safe_flank_route(
+        group,
+        runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate),
+        best_candidate.outside_position
+      )
+    end
     if #flank_waypoints > 0 then
-      record.replans = record.replans + 1
-      record.target_position = copy_position(best_candidate.position)
-      record.target_force_name = best_candidate.entity.force.name
-      record.flank_waypoints = flank_waypoints
-      record.flank_index = 1
-      record.state = "flanking"
-      record_debug_event("flank_waypoint_set", record, {
-        reason = "better-flank",
-        target_position = flank_waypoints[1],
-        selected_candidate_index = record.debug_selected_candidate_index
-      })
-      issue_move(record, group, flank_waypoints[1], 2)
+      if not try_activate_flank_route(record, group, flank_waypoints, best_candidate, "better-flank") then
+        local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+        begin_siege(record, group, siege_site_record)
+      end
       return
     end
 
     if current_candidate.cover_count > 0 and best_candidate.cover_count == 0 then
       local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+      if try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, siege_site_record) then
+        return
+      end
+      begin_siege(record, group, siege_site_record)
+      return
+    end
+  end
+
+  local _, ranged_range = get_group_ranged_members(group)
+  if best_candidate and best_candidate.cover_count > 0 and ranged_range > 1.5 then
+    local _, support_position = find_staging_positions(group, best_candidate, analysis)
+    if support_position then
+      local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+      if try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, siege_site_record) then
+        return
+      end
       begin_siege(record, group, siege_site_record)
       return
     end
@@ -4100,6 +5170,9 @@ local function plan_group_action(record, group)
 
   if analysis.closed and analysis.fully_covered and best_candidate then
     local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+    if try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, siege_site_record) then
+      return
+    end
     begin_siege(record, group, siege_site_record)
     return
   end
@@ -4118,7 +5191,7 @@ local function plan_group_action(record, group)
   issue_attack(record, group, record.target_position, record.target_force_name)
 end
 
-local function process_group_record(record_id)
+function process_group_record(record_id)
   local record = storage.group_ai[record_id]
   if not record then
     return
@@ -4133,13 +5206,17 @@ local function process_group_record(record_id)
   record.last_seen_tick = game.tick
   record.last_position = copy_position(group.position)
   record.surface_name = group.surface.name
+  sync_record_runtime_state(record, group)
+
+  local is_debug_arena_group = record.scenario ~= nil and group.surface.name == DEBUG_ARENA_SURFACE_NAME
 
   if record.role ~= "support"
     and record.role ~= "assault"
     and record.role ~= "reserve"
     and group.is_unit_group
     and group.state == defines.group_state.gathering
-    and record.state == "tracking" then
+    and record.state == "tracking"
+    and not is_debug_arena_group then
     return
   end
 
@@ -4152,6 +5229,10 @@ local function process_group_record(record_id)
     and game.tick - record.activated_tick > MAX_SCRIPT_CONTROL_TICKS
     and record.state ~= "fallback-attack" then
     start_fallback_attack(record, group, "script-control-timeout")
+    return
+  end
+
+  if handle_state_stall(record, group) then
     return
   end
 
@@ -4208,17 +5289,25 @@ local function process_group_record(record_id)
 end
 
 do
-local function draw_debug_overlay()
+function draw_debug_overlay()
   clear_debug_overlay()
 
-  local player_indices = get_overlay_player_indices()
+  local player_contexts = get_overlay_player_contexts()
+  local player_indices = {}
+  for index = 1, #player_contexts do
+    player_indices[index] = player_contexts[index].player_index
+  end
+
   if #player_indices == 0 then
     return
   end
 
+  local rendered_sites = 0
   for _, site in pairs(storage.siege_sites) do
     local surface = game.surfaces[site.surface_index]
-    if surface then
+    if surface
+      and overlay_surface_is_visible(player_contexts, site.surface_index)
+      and overlay_position_is_visible(player_contexts, site.surface_index, site.target_position) then
       rendering.draw_circle({
         color = {r = 1, g = 0.75, b = 0.1},
         radius = 1.1,
@@ -4244,12 +5333,19 @@ local function draw_debug_overlay()
           draw_on_ground = true
         })
       end
+
+      rendered_sites = rendered_sites + 1
+      if rendered_sites >= DEBUG_OVERLAY_SITE_LIMIT then
+        break
+      end
     end
   end
 
+  local rendered_groups = 0
   for _, record in pairs(storage.group_ai) do
     local group = get_group(record)
-    if group then
+    if group
+      and overlay_position_is_visible(player_contexts, group.surface.index, group.position) then
       local label_position = {
         x = group.position.x,
         y = group.position.y - 1.5
@@ -4361,11 +5457,16 @@ local function draw_debug_overlay()
           })
         end
       end
+
+      rendered_groups = rendered_groups + 1
+      if rendered_groups >= DEBUG_OVERLAY_GROUP_LIMIT then
+        break
+      end
     end
   end
 end
 
-local function process_tracked_groups()
+function process_tracked_groups()
   ensure_globals()
   process_debug_arena_waves()
   prune_siege_sites()
@@ -4416,7 +5517,7 @@ local function process_tracked_groups()
   end
 end
 
-local function get_debug_status()
+function get_debug_status()
   ensure_globals()
 
   local tracked = 0
@@ -4460,6 +5561,7 @@ end
 clear_debug_runtime = function()
   ensure_globals()
   storage.debug.recent_events = {}
+  storage.debug.scenario_events = {}
 
   for _, record in pairs(storage.group_ai) do
     record.debug_candidates = nil
@@ -4502,7 +5604,84 @@ write_manual_dump = function(reason)
   write_arena_manifest()
 end
 
-command_debug = function(command)
+runtime_ext.setup_agent_bridge_scenario = function(scenario_name, player_index, options)
+  ensure_globals()
+
+  local scenario = DEBUG_SCENARIOS[scenario_name]
+  if not scenario then
+    error("unknown advanced-biter-tactics debug arena scenario: " .. tostring(scenario_name))
+  end
+
+  local player = player_index and game.get_player(player_index) or nil
+  local surface = arena_runtime.get_or_create_debug_surface()
+  purge_surface_runtime_state(surface.index)
+  arena_runtime.clear_debug_surface(surface)
+  clear_debug_runtime()
+  storage.debug.arena = nil
+  set_debug_enabled(0, true)
+
+  if player_index then
+    set_debug_enabled(player_index, true)
+  end
+
+  local wall_anchor_positions = arena_runtime.build_wall_segments(surface, "player", scenario)
+  local turret_positions = arena_runtime.build_turrets(surface, "player", scenario)
+  local structure_positions = arena_runtime.build_structures(surface, "player", scenario)
+  arena_runtime.seed_reuse_site(surface, scenario)
+  arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions, structure_positions)
+
+  local scenario_waves = scenario.waves or {{
+    delay = 0,
+    spawn_position = scenario.spawn_position,
+    target_position = scenario.target_position,
+    units = scenario.units
+  }}
+
+  if #scenario_waves > 0 then
+    storage.debug.arena.pending_waves = {}
+    for wave_index = 1, #scenario_waves do
+      local wave = scenario_waves[wave_index]
+      if (wave.delay or 0) <= 0 then
+        arena_runtime.spawn_debug_group(surface, scenario, wave, wave_index)
+        storage.debug.arena.spawned_wave_count = storage.debug.arena.spawned_wave_count + 1
+      else
+        storage.debug.arena.pending_waves[#storage.debug.arena.pending_waves + 1] = {
+          index = wave_index,
+          spawn_tick = game.tick + (wave.delay or 0),
+          spawn_position = copy_position(wave.spawn_position),
+          target_position = copy_position(wave.target_position),
+          units = wave.units
+        }
+      end
+    end
+
+    for _, site in pairs(storage.siege_sites) do
+      if site.surface_index == surface.index then
+        site.wave_count = storage.debug.arena.spawned_wave_count
+      end
+    end
+  end
+
+  if player and player.valid then
+    player.teleport(scenario.observe_position, surface)
+    arena_runtime.chart_debug_surface(surface, player)
+  end
+
+  write_manual_dump(options and options.reason or "agent-bridge-setup")
+
+  return {
+    scenario_name = scenario.name,
+    surface_name = surface.name,
+    observe_position = serialize_position(scenario.observe_position),
+    spawn_position = serialize_position(scenario.spawn_position),
+    target_position = serialize_position(scenario.target_position),
+    expected_support_mode = scenario.expected_support_mode,
+    expected_reuse_wave_count = scenario.expected_reuse_wave_count,
+    expected_event_sequence = scenario.expected_event_sequence
+  }
+end
+
+function command_debug(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -4587,10 +5766,13 @@ command_debug = function(command)
     game.print({"advanced-biter-tactics.debug-help"})
   end
 end
+
+commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
+script.on_nth_tick(PROCESS_INTERVAL, process_tracked_groups)
 end
 
 do
-local arena_runtime = {}
+arena_runtime = {}
 
 function arena_runtime.get_or_create_debug_surface()
   local surface = game.surfaces[DEBUG_ARENA_SURFACE_NAME]
@@ -4873,14 +6055,6 @@ function arena_runtime.spawn_debug_group(surface, scenario, wave_data, wave_inde
     end
   end
 
-  group.set_command({
-    type = defines.command.attack_area,
-    destination = target_position,
-    radius = ATTACK_RADIUS,
-    distraction = defines.distraction.by_enemy
-  })
-  group.start_moving()
-
   local record = storage.group_ai[group.unique_id] or register_group(group, "main", nil, scenario.name)
   if record then
     record.state = "tracking"
@@ -4900,7 +6074,9 @@ function arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor
   storage.debug.arena = {
     scenario = scenario.name,
     surface_name = surface.name,
+    observe_position = serialize_position(scenario.observe_position),
     spawn_position = serialize_position(scenario.spawn_position),
+    target_position = serialize_position(scenario.target_position),
     wall_anchor_positions = wall_anchor_positions,
     turret_positions = turret_positions,
     structure_positions = structure_positions,
@@ -4985,6 +6161,8 @@ function arena_runtime.seed_reuse_site(surface, scenario)
   storage.siege_sites[site_key] = site
   update_site_entry_positions(site, surface)
   if scenario.target_position then
+    site.seeded_inside_rally_position = copy_position(scenario.target_position)
+    site.seeded_exploit_position = copy_position(scenario.target_position)
     site.inside_rally_position = copy_position(scenario.target_position)
     site.exploit_position = copy_position(scenario.target_position)
   end
@@ -4992,7 +6170,7 @@ function arena_runtime.seed_reuse_site(surface, scenario)
   collect_local_assault_targets(surface, site)
 end
 
-local function command_debug_arena(command)
+function command_debug_arena(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
   if not allowed then
@@ -5010,57 +6188,10 @@ local function command_debug_arena(command)
     return
   end
 
-  local surface = arena_runtime.get_or_create_debug_surface()
-  purge_surface_runtime_state(surface.index)
-  arena_runtime.clear_debug_surface(surface)
-  clear_debug_runtime()
-  storage.debug.arena = nil
-
-  if command.player_index then
-    set_debug_enabled(command.player_index, true)
-  end
-
-  local wall_anchor_positions = arena_runtime.build_wall_segments(surface, "player", scenario)
-  local turret_positions = arena_runtime.build_turrets(surface, "player", scenario)
-  local structure_positions = arena_runtime.build_structures(surface, "player", scenario)
-  arena_runtime.seed_reuse_site(surface, scenario)
-  arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions, structure_positions)
-
-  local scenario_waves = scenario.waves or {{
-    delay = 0,
-    spawn_position = scenario.spawn_position,
-    target_position = scenario.target_position,
-    units = scenario.units
-  }}
-
-  if #scenario_waves > 0 then
-    storage.debug.arena.pending_waves = {}
-    for wave_index = 1, #scenario_waves do
-      local wave = scenario_waves[wave_index]
-      if (wave.delay or 0) <= 0 then
-        arena_runtime.spawn_debug_group(surface, scenario, wave, wave_index)
-        storage.debug.arena.spawned_wave_count = storage.debug.arena.spawned_wave_count + 1
-      else
-        storage.debug.arena.pending_waves[#storage.debug.arena.pending_waves + 1] = {
-          index = wave_index,
-          spawn_tick = game.tick + (wave.delay or 0),
-          spawn_position = copy_position(wave.spawn_position),
-          target_position = copy_position(wave.target_position),
-          units = wave.units
-        }
-      end
-    end
-
-    for _, site in pairs(storage.siege_sites) do
-      if site.surface_index == surface.index then
-        site.wave_count = storage.debug.arena.spawned_wave_count
-      end
-    end
-  end
+  local setup = runtime_ext.setup_agent_bridge_scenario(scenario_name, command.player_index, {reason = "arena-created"})
+  local surface = game.surfaces[setup.surface_name]
 
   if player and player.valid then
-    player.teleport(scenario.observe_position, surface)
-    arena_runtime.chart_debug_surface(surface, player)
     player.print({"advanced-biter-tactics.debug-arena-created",
       scenario.name,
       surface.name,
@@ -5093,13 +6224,358 @@ local function command_debug_arena(command)
       game.print({"advanced-biter-tactics.debug-arena-wave-count", scenario.expected_reuse_wave_count})
     end
   end
-
-  write_manual_dump("arena-created")
 end
 
 commands.add_command("abt-debug-arena", {"advanced-biter-tactics.command-help-arena"}, command_debug_arena)
 
-local function on_group_created(event)
+remote.add_interface("agent_bridge", {
+  list_scenarios = function()
+    local scenarios = {}
+    for name, scenario in pairs(DEBUG_SCENARIOS) do
+      scenarios[#scenarios + 1] = {
+        name = name,
+        observe_position = serialize_position(scenario.observe_position),
+        spawn_position = serialize_position(scenario.spawn_position),
+        target_position = serialize_position(scenario.target_position),
+        expected_support_mode = scenario.expected_support_mode,
+        expected_reuse_wave_count = scenario.expected_reuse_wave_count,
+        expected_behavior = scenario.expected_behavior,
+        expected_event_sequence = scenario.expected_event_sequence
+      }
+    end
+
+    table.sort(scenarios, function(left, right)
+      return left.name < right.name
+    end)
+
+    return scenarios
+  end,
+  setup_scenario = function(name, options)
+    return runtime_ext.setup_agent_bridge_scenario(name, nil, options)
+  end,
+  capture_frame = function(options)
+    ensure_globals()
+
+    local arena = storage.debug.arena
+    if not arena then
+      return nil
+    end
+
+    local surface = arena.surface_name and game.surfaces[arena.surface_name] or nil
+    if not surface then
+      return nil
+    end
+
+    local radius = options and tonumber(options.radius) or 48
+    local center = arena.observe_position or arena.spawn_position or {x = 0, y = 0}
+    local bounds = {
+      left_top = {
+        x = center.x - radius,
+        y = center.y - radius
+      },
+      right_bottom = {
+        x = center.x + radius,
+        y = center.y + radius
+      }
+    }
+
+    local visible_entities = {}
+    local entities = surface.find_entities_filtered({area = bounds})
+    for index = 1, #entities do
+      visible_entities[#visible_entities + 1] = runtime_ext.serialize_visible_entity(entities[index])
+    end
+
+    local groups = {}
+    for _, record in pairs(storage.group_ai) do
+      if record.scenario == arena.scenario then
+        groups[#groups + 1] = serialize_record(record)
+      end
+    end
+
+    local siege_sites = {}
+    for _, site in pairs(storage.siege_sites) do
+      if site.surface_index == surface.index then
+        siege_sites[#siege_sites + 1] = serialize_site(site)
+      end
+    end
+
+    return {
+      tick = game.tick,
+      mod_name = MOD_NAME,
+      scenario_name = arena.scenario,
+      reason = options and options.reason or "capture",
+      active_surface = surface.name,
+      viewport = {
+        center = serialize_position(center),
+        radius = radius,
+        bounds = serialize_bounds(bounds)
+      },
+      visible_entities = visible_entities,
+      alerts = {},
+      sounds = {},
+      gui = {
+        root = "none",
+        children = {}
+      },
+      scenario_markers = {
+        observe_position = serialize_position(arena.observe_position),
+        spawn_position = serialize_position(arena.spawn_position),
+        target_position = serialize_position(arena.target_position),
+        open_breach_positions = serialize_positions(arena.open_breach_positions),
+        viewport_hint = runtime_ext.serialize_area_from_center(center, radius)
+      },
+      groups = groups,
+      siege_sites = siege_sites,
+      recent_events = runtime_ext.get_recent_scenario_events(arena.scenario)
+    }
+  end,
+  evaluate_assertions = function(name, options)
+    ensure_globals()
+
+    local arena = storage.debug.arena
+    local scenario_name = name or (arena and arena.scenario) or nil
+    local scenario = scenario_name and DEBUG_SCENARIOS[scenario_name] or nil
+    local assertions = {}
+    local events = runtime_ext.get_recent_scenario_events(scenario_name)
+    local has_arena = arena ~= nil and scenario ~= nil and arena.scenario == scenario_name
+
+    assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+      "arena-created",
+      "invariant",
+      has_arena,
+      true,
+      has_arena,
+      {
+        scenario_name = scenario_name,
+        active_scenario = arena and arena.scenario or nil
+      }
+    )
+
+    if scenario then
+      local function find_first_event(event_name, predicate)
+        for index = 1, #events do
+          local event = events[index]
+          if event.event == event_name and (not predicate or predicate(event)) then
+            return event, index
+          end
+        end
+        return nil, nil
+      end
+
+      local function has_event(event_name, predicate)
+        return find_first_event(event_name, predicate) ~= nil
+      end
+
+      local actual_event_names = {}
+      for index = 1, #events do
+        actual_event_names[index] = events[index].event
+      end
+
+      local matches_sequence, matched, missing = runtime_ext.event_sequence_matches(events, scenario.expected_event_sequence or {})
+      assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+        "expected-event-sequence",
+        "sequence",
+        matches_sequence,
+        scenario.expected_event_sequence,
+        actual_event_names,
+        {
+          matched = matched,
+          missing = missing
+        }
+      )
+
+      if scenario.expected_support_mode then
+        local actual_support_mode = nil
+        local arena_surface = arena and game.surfaces[arena.surface_name] or nil
+        for _, site in pairs(storage.siege_sites) do
+          if arena_surface and site.surface_index == arena_surface.index and site.support_mode ~= nil and site.support_mode ~= "none" then
+            actual_support_mode = site.support_mode
+            break
+          end
+        end
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "support-mode",
+          "outcome",
+          actual_support_mode == scenario.expected_support_mode,
+          scenario.expected_support_mode,
+          actual_support_mode,
+          options or {}
+        )
+      end
+
+      if scenario.expected_reuse_wave_count then
+        local actual_wave_count = arena and arena.spawned_wave_count or 0
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "reuse-wave-count",
+          "outcome",
+          actual_wave_count == scenario.expected_reuse_wave_count,
+          scenario.expected_reuse_wave_count,
+          actual_wave_count,
+          options or {}
+        )
+      end
+
+      if scenario_name == "wall-covered-flank"
+        or scenario_name == "mixed-turret-breach" then
+        local first_open_event = find_first_event("breach_progress_updated", function(event)
+          return (event.breach_open_segments or 0) > 0
+        end)
+        local stop_tick = first_open_event and first_open_event.tick or math.huge
+        local coverage_violation = find_first_event("coverage_violation", function(event)
+          return (event.tick or 0) < stop_tick
+        end)
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "no-coverage-before-breach",
+          "outcome",
+          coverage_violation == nil,
+          true,
+          coverage_violation == nil,
+          {
+            coverage_violation = coverage_violation,
+            stop_tick = stop_tick
+          }
+        )
+      end
+
+      if scenario_name == "spitter-siege" then
+        local support_mode_event = find_first_event("support_mode_selected")
+        local pressure_event = support_mode_event and find_first_event("breach_pressure_detected", function(event)
+          return (event.tick or 0) >= support_mode_event.tick and (event.tick or 0) <= support_mode_event.tick + STALL_TIMEOUT_TICKS
+        end) or nil
+        local stalled_event = find_first_event("state_stalled", function(event)
+          return event.reason == "support-resetting" or event.reason == "support-moving" or event.reason == "support-sieging"
+        end)
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "support-progress-within-threshold",
+          "outcome",
+          support_mode_event ~= nil and pressure_event ~= nil and stalled_event == nil,
+          true,
+          pressure_event ~= nil,
+          {
+            support_mode_selected = support_mode_event,
+            breach_pressure_detected = pressure_event,
+            state_stalled = stalled_event,
+            threshold_ticks = STALL_TIMEOUT_TICKS
+          }
+        )
+      end
+
+      if scenario_name == "mixed-breach-siege" then
+        local breach_assault_event = find_first_event("breach_assault_planned")
+        local breach_group_id = breach_assault_event and breach_assault_event.group_id or nil
+        local first_turret_target = breach_assault_event and (
+          find_first_event("interior_target_selected", function(event)
+            return (event.tick or 0) >= breach_assault_event.tick
+              and (not breach_group_id or event.group_id == breach_group_id)
+              and event.reason == "combat-turret"
+          end)
+          or find_first_event("turret_priority_selected", function(event)
+            return (event.tick or 0) >= breach_assault_event.tick
+              and (not breach_group_id or event.group_id == breach_group_id)
+          end)
+        ) or nil
+        local first_wall_target = breach_assault_event and find_first_event("wall_target_after_breach", function(event)
+          return (event.tick or 0) >= breach_assault_event.tick
+            and (not breach_group_id or event.group_id == breach_group_id)
+        end) or nil
+
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "turret-targeted-after-breach",
+          "outcome",
+          breach_assault_event ~= nil and first_turret_target ~= nil,
+          true,
+          first_turret_target ~= nil,
+          {
+            breach_assault_planned = breach_assault_event,
+            first_turret_target = first_turret_target
+          }
+        )
+
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "no-wall-target-after-breach",
+          "outcome",
+          breach_assault_event ~= nil and first_wall_target == nil,
+          true,
+          first_wall_target == nil,
+          {
+            breach_assault_planned = breach_assault_event,
+            wall_target_after_breach = first_wall_target
+          }
+        )
+      end
+
+      if scenario_name == "breach-reuse" then
+        local entered_event = find_first_event("entry_progress_updated", function(event)
+          return event.reason == "inside"
+        end)
+        local interior_target_event = find_first_event("interior_target_selected")
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "reuse-entered-before-interior-target",
+          "outcome",
+          entered_event ~= nil
+            and interior_target_event ~= nil
+            and (entered_event.tick or 0) <= (interior_target_event.tick or math.huge),
+          true,
+          interior_target_event ~= nil,
+          {
+            entry_progress_updated = entered_event,
+            interior_target_selected = interior_target_event
+          }
+        )
+      end
+
+      if scenario_name == "flame-turret-breach" then
+        local cone_violation = find_first_event("coverage_violation", function(event)
+          return event.support_mode == "cone-siege"
+        end)
+        local active_cone_coverage = false
+        for _, record in pairs(storage.group_ai) do
+          if record.scenario == scenario_name and record.support_mode == "cone-siege" then
+            local group = get_group(record)
+            if group and #find_covering_turrets(group.surface, group.force, group.position) > 0 then
+              active_cone_coverage = true
+              break
+            end
+          end
+        end
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "cone-outside-flame-range",
+          "outcome",
+          cone_violation == nil and not active_cone_coverage,
+          true,
+          cone_violation == nil and not active_cone_coverage,
+          {
+            coverage_violation = cone_violation,
+            active_cone_coverage = active_cone_coverage
+          }
+        )
+      end
+    end
+
+    return assertions
+  end,
+  reset_scenario = function()
+    ensure_globals()
+
+    if storage.debug and storage.debug.arena and storage.debug.arena.surface_name and game.surfaces[storage.debug.arena.surface_name] then
+      local surface = game.surfaces[storage.debug.arena.surface_name]
+      purge_surface_runtime_state(surface.index)
+      arena_runtime.clear_debug_surface(surface)
+    end
+
+    clear_debug_runtime()
+    storage.debug.arena = nil
+    set_debug_enabled(0, false)
+
+    return {
+      reset = true
+    }
+  end
+})
+end
+
+do
+runtime_ext.on_group_created = function(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -5109,7 +6585,7 @@ local function on_group_created(event)
   register_group(event.group, existing and existing.role or "main", existing and existing.parent_id or nil, scenario)
 end
 
-local function on_group_finished(event)
+runtime_ext.on_group_finished = function(event)
   ensure_globals()
   local scenario
   if event.group and event.group.valid and event.group.surface.name == DEBUG_ARENA_SURFACE_NAME and storage.debug.arena then
@@ -5119,7 +6595,7 @@ local function on_group_finished(event)
   register_group(event.group, existing and existing.role or "main", existing and existing.parent_id or nil, scenario)
 end
 
-local function on_ai_command_completed(event)
+runtime_ext.on_ai_command_completed = function(event)
   ensure_globals()
   local record = storage.group_ai[event.unit_number]
   if record then
@@ -5149,8 +6625,8 @@ runtime_ext.on_entity_damaged = function(event)
             local debug_record
             for _, record in pairs(storage.group_ai) do
               if record.siege_site_id == site.key then
+                note_meaningful_progress(record)
                 debug_record = record
-                break
               end
             end
             record_debug_event("breach_pressure_detected", debug_record, {
@@ -5168,14 +6644,11 @@ runtime_ext.on_entity_damaged = function(event)
   end
 end
 
-script.on_event(defines.events.on_unit_group_created, on_group_created)
-script.on_event(defines.events.on_unit_group_finished_gathering, on_group_finished)
-script.on_event(defines.events.on_ai_command_completed, on_ai_command_completed)
+script.on_event(defines.events.on_unit_group_created, runtime_ext.on_group_created)
+script.on_event(defines.events.on_unit_group_finished_gathering, runtime_ext.on_group_finished)
+script.on_event(defines.events.on_ai_command_completed, runtime_ext.on_ai_command_completed)
 script.on_event(defines.events.on_entity_damaged, runtime_ext.on_entity_damaged)
-script.on_nth_tick(PROCESS_INTERVAL, process_tracked_groups)
 end
-
-commands.add_command("abt-debug", {"advanced-biter-tactics.command-help-debug"}, command_debug)
 
 script.on_init(repair_runtime_state)
 script.on_configuration_changed(repair_runtime_state)
