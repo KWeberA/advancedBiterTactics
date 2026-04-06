@@ -24,6 +24,7 @@ local DESIRED_BREACH_SEGMENTS = 3
 local MIN_BREACH_SEGMENTS = 2
 local SUPPORT_MAX_DRIFT = 4
 local SUPPORT_RETURN_RADIUS = 2
+local SUPPORT_STANDOFF_MIN_DISTANCE = 4
 local MOVE_REASSERT_TICKS = 60
 local BREACH_TARGET_RADIUS = 0.6
 local BREACH_TARGET_SEARCH_DISTANCE = 3.1
@@ -33,6 +34,7 @@ local INSIDE_RALLY_DISTANCE = 6
 local BREACH_EXPLOIT_DISTANCE = 12
 local BREACH_CORRIDOR_DISTANCE = 6
 local POST_BREACH_ENTRY_RADIUS = 3
+local POST_BREACH_ASSAULT_HANDOFF_TICKS = 180
 local MAX_MELEE_PER_TURRET = 10
 local SUPPORT_FOLLOW_TRIGGER_DISTANCE = 6
 local SUPPORT_FOLLOW_DISTANCE = 5
@@ -102,6 +104,7 @@ DEBUG_EVENT_NAMES = {
   fire_hazard_avoided = true,
   open_entry_taken = true,
   interior_target_selected = true,
+  wall_target_after_breach = true,
   breach_reused = true,
   coverage_violation = true,
   command_reasserted = true,
@@ -253,11 +256,14 @@ DEBUG_SCENARIOS = {
       {position = {x = 8, y = -4}, ammo = 200},
       {position = {x = 8, y = 4}, ammo = 200}
     },
+    structures = {
+      {name = "radar", position = {x = 10, y = 0}},
+      {name = "steel-chest", position = {x = 11, y = -2}},
+      {name = "steel-chest", position = {x = 11, y = 2}}
+    },
     units = {
-      {name = "medium-biter", count = 8},
-      {name = "big-biter", count = 4},
-      {name = "small-spitter", count = 6},
-      {name = "medium-spitter", count = 4}
+      {name = "behemoth-biter", count = 12},
+      {name = "big-spitter", count = 10}
     },
     expected_behavior = "Spitters should widen the breach from a safe standoff position while biters wait outside until the opening is at least two to three wall segments wide.",
     expected_event_sequence = {
@@ -265,10 +271,12 @@ DEBUG_SCENARIOS = {
       "contact_found",
       "wall_network_scanned",
       "candidates_scored",
-      "siege_site_selected",
+      "support_mode_selected",
       "standoff_position_selected",
       "support_group_created",
-      "attack_selected"
+      "siege_site_selected",
+      "breach_assault_planned",
+      "interior_target_selected"
     }
   },
   ["mixed-turret-breach"] = {
@@ -2347,7 +2355,7 @@ local function find_staging_positions(group, candidate, analysis)
       candidate.position,
       preferred_samples,
       analysis.probe_unit_name,
-      2,
+      SUPPORT_STANDOFF_MIN_DISTANCE,
       math.max(2, math.floor(ranged_range - 0.5)),
       ranged_range - 0.5
     )
@@ -3350,6 +3358,22 @@ local function issue_attack(record, group, target_position, defense_force_name)
   local target_entity = find_attack_target(group.surface, target_position, defense_force_name)
   local distraction = get_script_attack_distraction(record)
 
+  if record.entry_open then
+    local wall_target = target_entity
+    if not (wall_target and wall_target.valid and (wall_target.type == "wall" or wall_target.type == "gate")) then
+      wall_target = find_wall_entity_at(group.surface, defense_force_name, target_position)
+    end
+    if wall_target and wall_target.valid and (wall_target.type == "wall" or wall_target.type == "gate") then
+      record_debug_event("wall_target_after_breach", record, {
+        reason = "post-breach-wall-target",
+        target_position = wall_target.position,
+        target_turret_name = wall_target.name,
+        target_turret_position = wall_target.position,
+        entry_open = true
+      })
+    end
+  end
+
   if target_entity then
     group.set_command({
       type = defines.command.attack,
@@ -3383,6 +3407,16 @@ local function issue_attack_entity(record, group, target_entity)
   record.target_turret_position = copy_position(target_entity.position)
   record.target_turret_name = target_entity.name
   local distraction = get_script_attack_distraction(record)
+
+  if record.entry_open and (target_entity.type == "wall" or target_entity.type == "gate") then
+    record_debug_event("wall_target_after_breach", record, {
+      reason = "post-breach-wall-target",
+      target_position = target_entity.position,
+      target_turret_name = target_entity.name,
+      target_turret_position = target_entity.position,
+      entry_open = true
+    })
+  end
 
   group.set_command({
     type = defines.command.attack,
@@ -4221,6 +4255,17 @@ local function begin_siege(record, group, site)
     return
   end
 
+  if record.waiting_for_breach then
+    local remaining_ranged_members, remaining_ranged_range = get_group_ranged_members(group)
+    local current_cover = find_covering_turrets(group.surface, group.force, group.position)
+    if #remaining_ranged_members == 0
+      and remaining_ranged_range <= 1.5
+      and #current_cover == 0 then
+      record.rally_position = copy_position(group.position)
+      site.rally_position = copy_position(group.position)
+    end
+  end
+
   if reusable_entry and site.inside_rally_position then
     local reuse_event_name = ((site.wave_count or 0) > 1) and "breach_reused" or "open_entry_taken"
     record_debug_event("siege_site_selected", record, {
@@ -4368,10 +4413,6 @@ function handle_post_breach_planning(record, group)
     clear_command(record)
   end
 
-  if ensure_entry_traversed(record, group, site) then
-    return
-  end
-
   if #targets == 0 then
     issue_breach_exploit(record, group, site, "no-local-turrets")
     return
@@ -4390,6 +4431,19 @@ function handle_post_breach_planning(record, group)
       siege_site_id = site.key,
       entry_open = true
     })
+  end
+
+  if ensure_entry_traversed(record, group, site) then
+    local stalled_entry = record.state_since_tick
+      and game.tick - record.state_since_tick >= POST_BREACH_ASSAULT_HANDOFF_TICKS
+    if stalled_entry and focus_target then
+      clear_command(record)
+      record.role = "assault"
+      remove_id_from_list(site.reserve_group_ids, record.id)
+      append_unique_id(site.assault_group_ids, record.id)
+      assign_next_assault_target(record, group, site)
+    end
+    return
   end
 
   spawn_assault_groups_from_reserve(record, group, site, targets)
@@ -4485,7 +4539,9 @@ function handle_support_following(record, group)
   site.expires_tick = game.tick + SIEGE_SITE_TTL
   local targets = collect_local_assault_targets(group.surface, site)
   if #targets == 0 then
-    issue_breach_exploit(record, group, site, "support-exploit")
+    clear_command(record)
+    set_group_autonomous(group)
+    remove_group_record(record.id, false, "support-exploit-complete")
     return
   end
 
@@ -4728,6 +4784,16 @@ function handle_flank_state(record, group)
 end
 
 function handle_rally_state(record, group)
+  if record.waiting_for_breach
+    and record.rally_position
+    and distance_sq(group.position, record.rally_position) <= 9 then
+    clear_command(record)
+    record.state = "breach-waiting"
+    record.breach_wait_started_tick = record.breach_wait_started_tick or game.tick
+    note_meaningful_progress(record, group.position)
+    return
+  end
+
   if command_finished(record, group) then
     local move_failed = record.command_kind == "move"
       and record.rally_position
@@ -6350,7 +6416,6 @@ remote.add_interface("agent_bridge", {
       end
 
       if scenario_name == "wall-covered-flank"
-        or scenario_name == "mixed-breach-siege"
         or scenario_name == "mixed-turret-breach" then
         local first_open_event = find_first_event("breach_progress_updated", function(event)
           return (event.breach_open_segments or 0) > 0
@@ -6372,7 +6437,7 @@ remote.add_interface("agent_bridge", {
         )
       end
 
-      if scenario_name == "spitter-siege" or scenario_name == "mixed-breach-siege" then
+      if scenario_name == "spitter-siege" then
         local support_mode_event = find_first_event("support_mode_selected")
         local pressure_event = support_mode_event and find_first_event("breach_pressure_detected", function(event)
           return (event.tick or 0) >= support_mode_event.tick and (event.tick or 0) <= support_mode_event.tick + STALL_TIMEOUT_TICKS
@@ -6391,6 +6456,50 @@ remote.add_interface("agent_bridge", {
             breach_pressure_detected = pressure_event,
             state_stalled = stalled_event,
             threshold_ticks = STALL_TIMEOUT_TICKS
+          }
+        )
+      end
+
+      if scenario_name == "mixed-breach-siege" then
+        local breach_assault_event = find_first_event("breach_assault_planned")
+        local breach_group_id = breach_assault_event and breach_assault_event.group_id or nil
+        local first_turret_target = breach_assault_event and (
+          find_first_event("interior_target_selected", function(event)
+            return (event.tick or 0) >= breach_assault_event.tick
+              and (not breach_group_id or event.group_id == breach_group_id)
+              and event.reason == "combat-turret"
+          end)
+          or find_first_event("turret_priority_selected", function(event)
+            return (event.tick or 0) >= breach_assault_event.tick
+              and (not breach_group_id or event.group_id == breach_group_id)
+          end)
+        ) or nil
+        local first_wall_target = breach_assault_event and find_first_event("wall_target_after_breach", function(event)
+          return (event.tick or 0) >= breach_assault_event.tick
+            and (not breach_group_id or event.group_id == breach_group_id)
+        end) or nil
+
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "turret-targeted-after-breach",
+          "outcome",
+          breach_assault_event ~= nil and first_turret_target ~= nil,
+          true,
+          first_turret_target ~= nil,
+          {
+            breach_assault_planned = breach_assault_event,
+            first_turret_target = first_turret_target
+          }
+        )
+
+        assertions[#assertions + 1] = runtime_ext.make_bridge_assertion(
+          "no-wall-target-after-breach",
+          "outcome",
+          breach_assault_event ~= nil and first_wall_target == nil,
+          true,
+          first_wall_target == nil,
+          {
+            breach_assault_planned = breach_assault_event,
+            wall_target_after_breach = first_wall_target
           }
         )
       end
