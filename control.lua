@@ -60,6 +60,9 @@ local DEBUG_RECENT_EVENT_LIMIT = 32
 local DEBUG_SCENARIO_EVENT_LIMIT = 512
 local DEBUG_STATUS_EVENT_LIMIT = 10
 local DEBUG_OVERLAY_CANDIDATE_LIMIT = 8
+local DEBUG_OVERLAY_GROUP_LIMIT = 16
+local DEBUG_OVERLAY_SITE_LIMIT = 8
+local DEBUG_OVERLAY_VIEW_RADIUS = 96
 local DEBUG_ARENA_SURFACE_NAME = "abt-debug-arena"
 local DEBUG_ARENA_TILE_HALF_SIZE = 64
 
@@ -502,6 +505,51 @@ end
 local function get_overlay_player_indices()
   ensure_globals()
   return sanitize_debug_players()
+end
+
+local function get_overlay_player_contexts()
+  ensure_globals()
+  local player_indices = sanitize_debug_players()
+  local contexts = {}
+
+  for index = 1, #player_indices do
+    local player = game.get_player(player_indices[index])
+    if player and player.valid and player.surface then
+      contexts[#contexts + 1] = {
+        player_index = player.index,
+        surface_index = player.surface.index,
+        position = copy_position(player.position)
+      }
+    end
+  end
+
+  return contexts
+end
+
+local function overlay_surface_is_visible(contexts, surface_index)
+  for index = 1, #contexts do
+    if contexts[index].surface_index == surface_index then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function overlay_position_is_visible(contexts, surface_index, position)
+  if not position then
+    return false
+  end
+
+  local view_radius_sq = DEBUG_OVERLAY_VIEW_RADIUS * DEBUG_OVERLAY_VIEW_RADIUS
+  for index = 1, #contexts do
+    local context = contexts[index]
+    if context.surface_index == surface_index and distance_sq(context.position, position) <= view_radius_sq then
+      return true
+    end
+  end
+
+  return false
 end
 
 local function is_debug_capture_enabled()
@@ -5178,14 +5226,22 @@ do
 function draw_debug_overlay()
   clear_debug_overlay()
 
-  local player_indices = get_overlay_player_indices()
+  local player_contexts = get_overlay_player_contexts()
+  local player_indices = {}
+  for index = 1, #player_contexts do
+    player_indices[index] = player_contexts[index].player_index
+  end
+
   if #player_indices == 0 then
     return
   end
 
+  local rendered_sites = 0
   for _, site in pairs(storage.siege_sites) do
     local surface = game.surfaces[site.surface_index]
-    if surface then
+    if surface
+      and overlay_surface_is_visible(player_contexts, site.surface_index)
+      and overlay_position_is_visible(player_contexts, site.surface_index, site.target_position) then
       rendering.draw_circle({
         color = {r = 1, g = 0.75, b = 0.1},
         radius = 1.1,
@@ -5211,12 +5267,19 @@ function draw_debug_overlay()
           draw_on_ground = true
         })
       end
+
+      rendered_sites = rendered_sites + 1
+      if rendered_sites >= DEBUG_OVERLAY_SITE_LIMIT then
+        break
+      end
     end
   end
 
+  local rendered_groups = 0
   for _, record in pairs(storage.group_ai) do
     local group = get_group(record)
-    if group then
+    if group
+      and overlay_position_is_visible(player_contexts, group.surface.index, group.position) then
       local label_position = {
         x = group.position.x,
         y = group.position.y - 1.5
@@ -5327,6 +5390,11 @@ function draw_debug_overlay()
             draw_on_ground = true
           })
         end
+      end
+
+      rendered_groups = rendered_groups + 1
+      if rendered_groups >= DEBUG_OVERLAY_GROUP_LIMIT then
+        break
       end
     end
   end
