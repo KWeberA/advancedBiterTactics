@@ -457,6 +457,11 @@ local function format_number(value)
   return string.format("%.1f", value)
 end
 
+-- Ensure required top-level storage tables and debug sub-tables exist with sensible defaults.
+-- Initializes `storage.group_ai`, `storage.group_queue`, `storage.group_queue_index`, `storage.siege_sites`,
+-- and `storage.debug` with its expected fields: `enabled_players`, `recent_events`, `scenario_events`,
+-- `server_capture`, and `arena`.
+-- This function is safe to call repeatedly and preserves existing values.
 local function ensure_globals()
   storage.group_ai = storage.group_ai or {}
   storage.group_queue = storage.group_queue or {}
@@ -526,12 +531,17 @@ local function append_jsonl(path, data)
   helpers.write_file(path, helpers.table_to_json(data) .. "\n", true)
 end
 
+-- Ensures storage.debug.recent_events contains at most DEBUG_RECENT_EVENT_LIMIT entries.
+-- Removes oldest entries from the front of the list until its length is within the limit.
 local function trim_recent_events()
   while #storage.debug.recent_events > DEBUG_RECENT_EVENT_LIMIT do
     table.remove(storage.debug.recent_events, 1)
   end
 end
 
+-- Trims the stored recent events for a named scenario to the configured scenario event limit.
+-- If the scenario has more events than DEBUG_SCENARIO_EVENT_LIMIT, removes the oldest events until the count is within the limit.
+-- @param scenario_name The scenario key whose event list should be trimmed; if nil or not present no action is taken.
 local function trim_scenario_events(scenario_name)
   if not scenario_name then
     return
@@ -547,6 +557,9 @@ local function trim_scenario_events(scenario_name)
   end
 end
 
+-- Serialize a position into a compact `{x,y}` table with coordinates rounded to two decimal places.
+-- @param position Table containing numeric `x` and `y` coordinates, or `nil`.
+-- @return A new table `{x = <number>, y = <number>}` with each coordinate rounded to two decimals, or `nil` if `position` is falsy.
 local function serialize_position(position)
   if not position then
     return nil
@@ -570,6 +583,9 @@ local function serialize_positions(positions)
   return serialized
 end
 
+-- Serializes rectangular bounds into a table containing serialized `left_top` and `right_bottom` positions.
+-- @param bounds Table containing `left_top` and `right_bottom` position tables; may be nil.
+-- @return A table with `left_top` and `right_bottom` serialized positions, or `nil` if `bounds` is falsy.
 local function serialize_bounds(bounds)
   if not bounds then
     return nil
@@ -594,6 +610,9 @@ runtime_ext.serialize_area_from_center = function(position, radius)
   })
 end
 
+-- Compute the centroid (component-wise average) of a list of positions.
+-- @param positions Array of position tables with numeric `x` and `y` fields.
+-- @return A position table `{x = <avg_x>, y = <avg_y>}` representing the average, or `nil` if `positions` is falsy or empty.
 local function average_positions(positions)
   if not positions or #positions == 0 then
     return nil
@@ -659,6 +678,10 @@ local function get_group(record)
   return nil
 end
 
+-- Ensure a group record has all expected fields, applying sensible defaults and making defensive copies of position data.
+-- Positional fields are deep-copied to avoid shared references; boolean/numeric fields are normalized.
+-- @param record The group record table to normalize, or `nil`.
+-- @return The normalized record table (mutated in-place), or `nil` if `record` was falsy.
 local function normalize_group_record(record)
   if not record then
     return nil
@@ -709,6 +732,10 @@ local function normalize_group_record(record)
   return record
 end
 
+-- Normalize and sanitize a siege site record for consistent runtime use.
+-- Ensures positional fields are deep-copied, required lists/maps exist, boolean and numeric fields are coerced, and sensible defaults are applied.
+-- @param site The siege site table to normalize (may be an existing stored record).
+-- @return The normalized site table, or `nil` if `site` was falsy.
 local function normalize_site(site)
   if not site then
     return nil
@@ -831,6 +858,20 @@ local function get_candidate_debug_score(candidate)
     + candidate.density
 end
 
+-- Convert a siege site record into a compact, serializable snapshot for debug capture.
+-- The snapshot includes positional fields, group associations, breach segment counts,
+-- and a boolean `breach_pressure_active` (true when `last_breach_pressure_tick` is recent).
+-- @param site The siege site table to serialize (as stored in storage.siege_sites).
+-- @return A table containing the serialized site with keys:
+--   `key`, `surface`, `target_position`, `approach_side`, `rally_position`,
+--   `support_position`, `support_mode`, `support_rejection_reason`,
+--   `cone_lane_positions`, `breach_positions`, `breach_attack_order`,
+--   `breach_required_segments`, `breach_open_segments`, `entry_open`, `entry_clear`,
+--   `entry_position`, `inside_rally_position`, `exploit_position`,
+--   `assault_targets`, `active_flame_turrets`, `reserve_group_ids`,
+--   `assault_group_ids`, `cone_group_ids`, `flame_hazard_bounds`,
+--   `defense_force_name`, `last_breach_pressure_tick`, `breach_pressure_active`,
+--   `wave_count`, and `expires_tick`.
 local function serialize_site(site)
   local surface = game.surfaces[site.surface_index]
   local breach_open_segments = 0
@@ -872,6 +913,9 @@ local function serialize_site(site)
   }
 end
 
+-- Produce a serializable snapshot of a tracked group record augmented with runtime diagnostics.
+-- @param record The stored group record to serialize; may reference a live group when available.
+-- @return A table with compact fields for debug capture and diagnostics, including identity, role/state/timestamps, serialized positions, command and siege/breach metadata, coverage/hazard/entry-progress diagnostics, and debug analysis data.
 local function serialize_record(record)
   local group = get_group(record)
   local diagnostics = get_runtime_group_diagnostics and get_runtime_group_diagnostics(record, group) or {}
@@ -996,6 +1040,8 @@ local function write_latest_snapshot(reason)
   }, false)
 end
 
+-- Writes the current debug arena metadata to the configured arena manifest file.
+-- If no arena data exists in `storage.debug.arena`, this is a no-op.
 local function write_arena_manifest()
   if storage.debug.arena then
     json_write(DEBUG_FILES.arena_manifest, storage.debug.arena, false)
@@ -1058,6 +1104,11 @@ runtime_ext.make_bridge_assertion = function(name, assertion_type, passed, expec
   }
 end
 
+-- Record a debug event containing contextual group/site diagnostics into in-memory debug storage and, when enabled, the JSONL capture file.
+-- The function builds a payload (tick, event name, group/site identifiers, positions, state/progress/coverage/hazard fields, and optional scenario/wave info), appends it to storage.debug.recent_events, and — if a `scenario` is present — also appends it to storage.debug.scenario_events[scenario]. When capture is enabled, the payload is appended to the events JSONL file.
+-- @param event_name string The name of the debug event; only events enabled in DEBUG_EVENT_NAMES are recorded.
+-- @param record? table Optional group record used to populate payload fields when a live group is not supplied in `extra`.
+-- @param extra? table Optional overrides and additional fields to include in the payload (e.g., target_position, contact_position, support_mode, siege_site_id, scenario, wave_index, entry_progress, coverage_sources, in_turret_coverage, in_flame_hazard, breach_pressure_active, etc.).
 local function record_debug_event(event_name, record, extra)
   if not DEBUG_EVENT_NAMES[event_name] then
     return
@@ -1117,6 +1168,11 @@ local function record_debug_event(event_name, record, extra)
   end
 end
 
+-- Record the current tick as the group's most recent meaningful progress and update its anchor position when provided.
+-- Updates `record.last_meaningful_progress_tick` to the current game tick and, if `position` is given, sets
+-- `record.progress_anchor_position` to a shallow copy of that position.
+-- @param record The group record table to update; must be non-nil.
+-- @param position (Optional) A `{x, y}` position whose copy will become the record's `progress_anchor_position`.
 local function note_meaningful_progress(record, position)
   if not record then
     return
@@ -1128,6 +1184,14 @@ local function note_meaningful_progress(record, position)
   end
 end
 
+-- Synchronizes runtime diagnostics for a group record with the current live group state.
+-- Updates the record's state timestamp and progress anchors when the state changes or the group has moved
+-- enough to be considered meaningful progress, and computes the current breach-entry progress when a
+-- siege site and live group position are available.
+-- @param record The stored group record to update; its runtime fields (e.g. `last_state_name`, `state_since_tick`,
+--               `last_stalled_state`, `progress_anchor_position`, `entry_progress`) may be modified.
+-- @param group The live unit group entity (may be `nil`) whose position is used to update progress anchors
+--              and compute `entry_progress`.
 local function sync_record_runtime_state(record, group)
   if record.last_state_name ~= record.state then
     record.last_state_name = record.state
@@ -1152,6 +1216,9 @@ local function sync_record_runtime_state(record, group)
   end
 end
 
+-- Decides whether a group record must use coverage-aware pre-breach safety before attempting entry.
+-- @param record The group record from storage.group_ai (may be nil).
+-- @return `true` if the record represents a group that requires pre-breach safety (entry is closed and the record's role, state, or support mode indicates a need for safe-standoff or cone-siege behavior), `false` otherwise.
 local function prebreach_safety_required(record)
   if not record or record.entry_open then
     return false
@@ -1169,6 +1236,11 @@ local function prebreach_safety_required(record)
     or record.support_mode == "cone-siege"
 end
 
+-- Emit a debug event indicating the group is in turret coverage where movement was blocked.
+-- @param record The group record associated with the coverage violation.
+-- @param position The map position `{x, y}` where the violation occurred.
+-- @param reason A short string describing why the coverage is considered a violation (e.g., "path", "destination").
+-- @param turrets Optional array of turret entities contributing to the coverage; may be nil.
 local function emit_coverage_violation(record, position, reason, turrets)
   record_debug_event("coverage_violation", record, {
     reason = reason,
@@ -1179,6 +1251,15 @@ local function emit_coverage_violation(record, position, reason, turrets)
   })
 end
 
+-- Detects when a tracked group has made no meaningful progress in a stallable state and performs remediation.
+-- If the group's `last_meaningful_progress_tick` is older than `STALL_TIMEOUT_TICKS` and the state is one of
+-- `support-moving`, `support-resetting`, `support-sieging`, `rallying`, `breach-waiting`, or `flanking`, this function
+-- records a `state_stalled` debug event and attempts recovery actions appropriate to the role/state (for support role:
+-- replan support mode between `safe-standoff` and `cone-siege`, or fall back to an attack; for rallying/breach-waiting:
+-- clear the current command and refresh progress anchors).
+-- @param record The persisted AI record for the group (storage.group_ai entry) to inspect and modify.
+-- @param group The live unit group entity associated with `record`.
+-- @return `true` if the function performed a replanning action that changes record state/commands, `false` otherwise.
 local function handle_state_stall(record, group)
   if not record.last_meaningful_progress_tick then
     return false
@@ -1260,6 +1341,9 @@ local function handle_state_stall(record, group)
   return false
 end
 
+-- Checks whether the provided force represents the enemy force.
+-- @param force The game force object to test (may be nil).
+-- @return `true` if `force` is valid and its name is "enemy", `false` otherwise.
 local function is_enemy_force(force)
   return force and force.valid and force.name == "enemy"
 end
@@ -1328,6 +1412,12 @@ local function is_position_walkable(surface, position, probe_unit_name)
   })
 end
 
+-- Finds defense turrets that can attack the given position.
+-- @param surface The surface to search on.
+-- @param enemy_force The force (team) that owns candidate turrets.
+-- @param position The target position `{x, y}` to test for turret coverage.
+-- @return A list of turret entities whose attack range includes `position`.
+-- @return The largest attack range among those turrets (0 if none).
 local function find_covering_turrets(surface, enemy_force, position)
   local nearby_turrets = surface.find_entities_filtered({
     position = position,
@@ -1369,6 +1459,11 @@ serialize_turret_sources = function(turrets)
   return sources
 end
 
+-- Calculates fire hazard around a position by scoring nearby fire entities and collecting their positions.
+-- @param surface The LuaSurface to search on.
+-- @param position The center `{x,y}` position to evaluate.
+-- @return hazard_score The summed hazard score (higher means more/closer fires).
+-- @return hazard_positions Array of `{x,y}` positions for each nearby fire entity.
 local function get_position_fire_hazard(surface, position)
   if not (surface and position) then
     return 0, {}
@@ -1392,6 +1487,14 @@ local function get_position_fire_hazard(surface, position)
   return hazard_score, hazard_positions
 end
 
+-- Check whether a straight path between two positions is covered by enemy turrets.
+-- Samples the segment from `from_position` to `to_position`, finds turrets of `enemy_force` that cover any sample,
+-- and returns a deduplicated list of those turret entities.
+-- @param surface The surface to search on.
+-- @param enemy_force The enemy force (force object or force name) whose turrets should be considered.
+-- @param from_position Table with `x` and `y` coordinates for the path start.
+-- @param to_position Table with `x` and `y` coordinates for the path end.
+-- @return `true` if any turret covers at least one sampled point on the path, `false` otherwise, and an array of unique turret entities that provide coverage.
 local function path_has_turret_coverage(surface, enemy_force, from_position, to_position)
   if not (surface and from_position and to_position) then
     return false, {}
@@ -1466,6 +1569,10 @@ get_runtime_group_diagnostics = function(record, group)
   return diagnostics
 end
 
+-- Selects the outside sample with the lowest turret coverage, breaking ties by proximity to a reference position.
+-- @param samples Array of sample tables, each containing `position` (`{x,y}`) and optional numeric `cover_count`.
+-- @param reference_position Table `{x,y}` used to break ties by distance.
+-- @return The sample table with minimal `cover_count` (and minimal squared distance on ties), or `nil` if `samples` is empty.
 local function choose_outside_sample(samples, reference_position)
   local best_sample
   local best_cover_count
@@ -1523,6 +1630,25 @@ local function make_wall_node(entity)
   }
 end
 
+-- Analyze a contiguous network of wall/gate entities starting from a given wall and return a graph of nodes, outside-sample candidates, and turret-coverage metadata.
+-- @param group The enemy group (provides `surface` and `force` used for scans).
+-- @param start_entity The starting wall or gate entity to begin the network traversal.
+-- @return A table with:
+--   nodes: map of node_key -> node where each node contains:
+--     position: sampled position of the wall/gate,
+--     neighbor_keys: map of adjacent node keys,
+--     neighbor_count: number of adjacent nodes in the discovered network,
+--     density: neighbor_count + 1,
+--     outside_samples: array of sample objects `{ direction, position, cover_count }`,
+--     cover_turrets: array of turret entities covering the node position (when sampled),
+--     max_cover_range: maximum turret range among `cover_turrets` (when sampled),
+--     cover_count: number of `cover_turrets` (when sampled).
+--   order: array of node_keys in the order they were discovered.
+--   truncated: `true` if traversal stopped early due to configured limits.
+--   closed: `true` when the discovered network appears closed (not truncated, has enough nodes, and no open ends).
+--   fully_covered: `true` if every discovered candidate node reports at least one covering turret.
+--   candidates: array of nodes that have usable outside samples (potential contact/breach candidates).
+--   probe_unit_name: unit name used for walkability probing.
 local function analyze_wall_network(group, start_entity)
   local surface = group.surface
   local enemy_force = group.force
@@ -1783,6 +1909,11 @@ local function build_wall_path(nodes, start_key, goal_key)
   return path
 end
 
+-- Constructs a sequence of outside flank waypoints along the wall node path from the current candidate toward the best candidate.
+-- @param analysis Table containing wall `nodes` and related analysis produced by analyze_wall_network.
+-- @param current_candidate Candidate table with `key` and `outside_position` representing the group's current contact point.
+-- @param best_candidate Candidate table with `key`, `outside_position`, and `outside_samples` representing the chosen flank target.
+-- @return Array of position tables ({x, y}) ordered from near the current candidate toward the best candidate; may be empty if no flank route is appropriate.
 local function build_flank_waypoints(analysis, current_candidate, best_candidate)
   if current_candidate.key == best_candidate.key then
     return {}
@@ -1833,6 +1964,13 @@ local function build_flank_waypoints(analysis, current_candidate, best_candidate
   return waypoints
 end
 
+-- Builds perimeter flank waypoint route sets around a closed wall network using two outside candidates.
+-- Returns a list of waypoint routes (each route is an array of `{x,y}` positions) that traverse the network perimeter toward `best_candidate.outside_position`.
+-- If `analysis` is not a closed network or required candidate fields are missing, returns an empty table.
+-- @param analysis Table returned by wall network analysis; must include `closed` and `nodes` with node `position.x`/`position.y`.
+-- @param current_candidate Candidate table with `outside_position`, `outside_direction`, and optional `max_cover_range`; treated as the route start side.
+-- @param best_candidate Candidate table with `outside_position`, `outside_direction`, and optional `max_cover_range`; treated as the route goal.
+-- @return A table of route sets; each route set is an ordered array of position tables `{x=number,y=number}`.
 function runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate)
   if not (analysis and analysis.closed and current_candidate and best_candidate and current_candidate.outside_position and best_candidate.outside_position) then
     return {}
@@ -1918,6 +2056,11 @@ function runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate
   return routes
 end
 
+-- Filters a sequence of flank waypoints to those that are safe from turret coverage and path exposure, optionally appending a safe preferred position.
+-- @param group The unit group used to evaluate surface, force, and starting position; if falsy the original waypoints are returned.
+-- @param waypoints Array of `{x,y}` waypoint positions to filter in order.
+-- @param preferred_position Optional `{x,y}` position to append as a final waypoint if reachable and not covered.
+-- @return Array of `{x,y}` waypoints that are safe for the group to traverse (may be empty).
 local function filter_safe_flank_waypoints(group, waypoints, preferred_position)
   if not group or #waypoints == 0 then
     return waypoints
@@ -1948,6 +2091,12 @@ local function filter_safe_flank_waypoints(group, waypoints, preferred_position)
   return safe_waypoints
 end
 
+-- Chooses the safest flank route whose first waypoint is nearest the group's current position.
+-- Filters each candidate route to remove unsafe waypoints, then selects the route whose first remaining waypoint has the smallest squared distance to the group's position.
+-- @param group The unit group object (expects a .position `{x,y}` field).
+-- @param route_sets Array of routes; each route is an array of waypoint positions (`{x,y}`).
+-- @param preferred_position Optional `{x,y}` used to prefer keeping a fallback waypoint when filtering.
+-- @return An array of waypoint positions for the selected safe route, or an empty table if no safe route exists.
 function runtime_ext.choose_safe_flank_route(group, route_sets, preferred_position)
   local best_route = {}
   local best_score
@@ -1966,6 +2115,10 @@ function runtime_ext.choose_safe_flank_route(group, route_sets, preferred_positi
   return best_route
 end
 
+-- Choose the breach axis orientation for a wall candidate.
+-- @param analysis Table containing a `nodes` map produced by wall network analysis; each node is expected to have `position` and `neighbor_keys`.
+-- @param candidate Table with `key` identifying the node in `analysis.nodes` and `position` `{x,y}`.
+-- @return The string `"horizontal"` if the summed horizontal offsets to neighbors exceed the summed vertical offsets, `"vertical"` otherwise.
 local function determine_breach_axis(analysis, candidate)
   local node = analysis.nodes[candidate.key]
   if not node then
@@ -2216,6 +2369,18 @@ local function find_staging_position(surface, defense_force_name, target_positio
   return best_safe_position, best_fallback_position
 end
 
+-- Chooses staging positions for an assault: a rally point, an optional support position (or cone lanes), and support mode metadata for a candidate breach.
+-- @param group The unit group considering the candidate.
+-- @param candidate The wall/candidate analysis entry describing outside samples, cover turrets, and outside position.
+-- @param analysis Supplemental wall analysis context (used for probe unit and sampling).
+-- @return rally_position The chosen rally position (table with x/y) or fallback position when no safe stage found.
+-- @return support_position The chosen support position (table with x/y) or `nil` if none.
+-- @return ranged_members Array of ranged member units from the group.
+-- @return ranged_range Numeric effective attack range of the group's ranged members.
+-- @return outside_direction The candidate's outside direction vector or `nil`.
+-- @return support_rejection_reason String reason why safe standoff support was rejected, or `nil`.
+-- @return support_mode String describing chosen support mode: `"none"`, `"safe-standoff"`, or `"cone-siege"`.
+-- @return cone_lane_positions Array of lane waypoint positions for cone-siege mode, or `nil`.
 local function find_staging_positions(group, candidate, analysis)
   local defense_force_name = candidate.entity.force.name
   local ranged_members, ranged_range = get_group_ranged_members(group)
@@ -2347,6 +2512,17 @@ local function find_walkable_position_near(surface, origin, probe_unit_name, sea
   return copy_position(origin)
 end
 
+-- Builds a set of walkable, turret-safe standoff positions arranged in a cone around a target for ranged support.
+-- The returned positions form lane offsets from an anchor direction (or a preferred cardinal side) at a distance constrained by `ranged_range` and `minimum_base_distance`; positions are filtered to be walkable for `probe_unit_name` and not covered by enemy turrets. Returns an empty array if inputs are invalid or no safe positions are found.
+-- @param surface The surface to search on.
+-- @param target_position Center position of the enemy target the cone faces.
+-- @param anchor_position Reference position used to derive the cone direction (typically the group or rally point).
+-- @param preferred_side Optional preferred cardinal side name to force cone direction (overrides anchor-derived direction).
+-- @param probe_unit_name Name of a unit used to test walkability when finding nearby positions.
+-- @param ranged_range Maximum desired attack range for ranged members; must be > 1.5.
+-- @param minimum_base_distance Optional minimum base distance from the target for lane placement.
+-- @param allow_out_of_range If true, positions beyond `ranged_range` are allowed when needed.
+-- @return An array of position tables ({x=number,y=number}) representing lane positions; may be empty.
 function runtime_ext.build_support_cone_positions(surface, target_position, anchor_position, preferred_side, probe_unit_name, ranged_range, minimum_base_distance, allow_out_of_range)
   if not (target_position and anchor_position and ranged_range and ranged_range > 1.5) then
     return {}
@@ -2406,6 +2582,9 @@ function runtime_ext.build_support_cone_positions(surface, target_position, anch
   return best_lane_positions
 end
 
+-- Selects lane indices for arranging ranged units into cone lanes based on the requested split count.
+-- @param split_count The desired number of splits (non-negative integer).
+-- @return A list (array) of lane index numbers to use: {3} when `split_count` <= 1, {2, 4} when `split_count` == 2, and {1, 3, 5} when `split_count` >= 3.
 function runtime_ext.get_cone_lane_indices(split_count)
   if split_count <= 1 then
     return {3}
@@ -2456,6 +2635,12 @@ function runtime_ext.choose_support_cone_lane(record, surface, enemy_force)
   return best_index, lane_positions, best_score or 0, best_hazards
 end
 
+-- Compute the siege site's breach-center position and a normalized entry direction vector.
+-- The breach center is the average of `site.breach_positions` when available, otherwise `site.target_position`, otherwise `{x = 0, y = 0}`.
+-- The direction is chosen (in priority): the opposite of the configured `site.approach_side` vector, the vector from `site.rally_position` toward the breach center, the vector from `site.support_position` toward the breach center, or the default unit X axis `(1, 0)` when none are available.
+-- @return breach_center A table with `x` and `y` coordinates for the breach center.
+-- @return direction_x The X component of the entry direction vector.
+-- @return direction_y The Y component of the entry direction vector.
 local function get_site_entry_vector(site)
   local breach_center = average_positions(site.breach_positions) or site.target_position or {x = 0, y = 0}
   local direction_x, direction_y = 0, 0
@@ -2483,6 +2668,12 @@ local function get_site_entry_vector(site)
   return breach_center, direction_x, direction_y
 end
 
+-- Compute a position's progress along and lateral offset from a siege site's breach entry axis.
+-- @param site The siege site record containing a breach center and breach positions used to derive the entry axis.
+-- @param position The position to evaluate (table with `x` and `y`).
+-- @return progress The signed distance from the site's breach center along the entry axis (positive moves toward the interior).
+-- @return lateral The absolute perpendicular distance from the entry axis.
+-- @return lateral_limit The effective lateral limit for the breach (maximum lateral extent of breach positions plus 2).
 function runtime_ext.get_breach_entry_progress(site, position)
   if not (site and position) then
     return nil, nil, nil
@@ -2510,6 +2701,14 @@ function runtime_ext.get_breach_entry_progress(site, position)
   return progress, lateral, lateral_limit + 2
 end
 
+-- Updates a siege site's computed entry, inside rally, exploit positions, and flame hazard bounds based on its breach axis.
+-- If `surface` is provided, attempts to adjust positions to nearby walkable tiles for the site's probe unit.
+-- If `site.seeded_inside_rally_position` or `site.seeded_exploit_position` exist, those seeded values override the computed inside-rally or exploit positions respectively.
+-- @param site The siege site table to normalize and update (mutated in-place).
+-- @param surface Optional surface used to find walkable fallback positions; pass `nil` to keep raw computed coordinates.
+-- @return breach_center The computed center point of the breach.
+-- @return direction_x The normalized x component of the breach approach vector.
+-- @return direction_y The normalized y component of the breach approach vector.
 local function update_site_entry_positions(site, surface)
   normalize_site(site)
   local breach_center, direction_x, direction_y = get_site_entry_vector(site)
@@ -2795,6 +2994,13 @@ local function choose_assault_target(site, surface, exclude_record_id)
   return nil, targets, loads
 end
 
+-- Compute up to three safe flame-lane staging positions for attacking a turret.
+-- Updates the site's entry positions before computing lanes. For each of three lateral offsets (left, center, right),
+-- selects a walkable position along the approach vector at increasing staging distances; prefers the first position not covered by enemy turrets and falls back to the best walkable position found.
+-- @param site Siege site object whose entry/target metadata will be refreshed and used to derive approach vectors.
+-- @param target Table with at least `position` (`{x,y}`) and `range` numeric fields describing the turret target.
+-- @param surface LuaSurface on which walkability and turret coverage are tested.
+-- @return Array of up to three `{x,y}` positions (left, center, right) suitable as flame-lane staging points.
 local function build_flame_lane_positions(site, target, surface)
   update_site_entry_positions(site, surface)
   local entry_position = site.entry_position or site.target_position
@@ -2855,6 +3061,16 @@ local function get_fire_entities_near(surface, position)
   return score, hazards
 end
 
+-- Chooses the most suitable flame lane for an assault based on nearby fire hazards and turret coverage.
+-- Prefers the current lane when its score is no worse than the best; if switching farther than one lane, prefers an adjacent lane when its score is within 1 of the best.
+-- @param record The group's stored record (may contain `lane_index` as the current lane).
+-- @param site The siege site data used to build lane positions.
+-- @param target The assault target entity used to orient lane positions.
+-- @param surface The LuaSurface on which to evaluate hazards and turret coverage.
+-- @return best_index The selected lane index (1-based).
+-- @return lane_positions Array of candidate lane positions.
+-- @return best_score Numeric hazard score for the chosen lane (lower is better).
+-- @return best_hazards Array of nearby fire entities influencing the chosen lane.
 local function choose_flame_lane(record, site, target, surface)
   local lane_positions = build_flame_lane_positions(site, target, surface)
   local current_lane = record.lane_index or 2
@@ -2895,6 +3111,12 @@ local function choose_flame_lane(record, site, target, surface)
   return best_index, lane_positions, best_score or 0, best_hazards or {}
 end
 
+-- Begin tracking a new command on a group record by writing command metadata and timestamps into `record`.
+-- @param record The persistent group record to update.
+-- @param kind A string identifying the command kind (e.g., "move", "attack").
+-- @param target_position Optional `{x, y}` position serving as the command target.
+-- @param radius Optional completion radius in tiles; defaults to 3.
+-- @param timeout Optional tick count after which the command is considered timed out.
 local function begin_command(record, kind, target_position, radius, timeout)
   record.activated_tick = record.activated_tick or game.tick
   record.command_kind = kind
@@ -3171,6 +3393,11 @@ local function find_attack_target(surface, position, defense_force_name)
   return nil
 end
 
+-- Issue a move order for a unit group toward a destination and register it for command lifecycle tracking.
+-- @param record The stored group record used to track the issued command and its timeout/progress.
+-- @param group The live unit group to receive the move order.
+-- @param position The target position table with `x` and `y` fields.
+-- @param radius Optional acceptance radius in tiles; defaults to 3.
 local function issue_move(record, group, position, radius)
   group.set_command({
     type = defines.command.go_to_location,
@@ -3186,6 +3413,14 @@ local function issue_move(record, group, position, radius)
   begin_command(record, "move", position, radius or 3, MOVE_COMMAND_TIMEOUT)
 end
 
+-- Attempts to issue a move command to `position` while blocking movement if turret coverage would make the destination or path unsafe.
+-- If pre-breach safety checks are required and turret coverage is detected, emits a `coverage_violation` event and does not issue a move.
+-- @param record The stored group record used for diagnostics and event emission.
+-- @param group The live unit group whose position/surface/force are used for checks and command issuance.
+-- @param position Table with `x` and `y` coordinates specifying the intended destination.
+-- @param radius Completion radius for the move command.
+-- @param reason Optional string describing the context for the move; used when emitting a `coverage_violation`.
+-- @return `true` if a move command was issued, `false` if the move was blocked due to turret coverage.
 local function issue_safe_move(record, group, position, radius, reason)
   if prebreach_safety_required(record) then
     local covering_turrets = find_covering_turrets(group.surface, group.force, position)
@@ -3205,6 +3440,11 @@ local function issue_safe_move(record, group, position, radius, reason)
   return true
 end
 
+-- Issues an attack command for the unit group at the given position, preferring a live defender entity when one is found, and initializes command tracking on the record.
+-- @param record The group AI record used to track the issued command and its progress.
+-- @param group The unit group to receive the attack command.
+-- @param target_position Table with `x` and `y` coordinates specifying the attack destination.
+-- @param defense_force_name The force name to search for a nearest defensive entity to target.
 local function issue_attack(record, group, target_position, defense_force_name)
   local target_entity = find_attack_target(group.surface, target_position, defense_force_name)
 
@@ -3373,6 +3613,13 @@ local function issue_breach_exploit(record, group, site, reason)
   })
 end
 
+-- Updates the record's breach-open progress for its siege target and returns whether the breach is currently open enough and how many segments are open.
+-- If the record has no `breach_positions`, clears `breach_open_segments` and returns `false, 0`.
+-- Emits a `breach_progress_updated` debug event and calls `note_meaningful_progress` when the open-segment count changes.
+-- @param record The group record table (will be mutated; `breach_open_segments` is updated).
+-- @param surface The surface to inspect for breach openness.
+-- @return `true` if the breach is open enough for the record's required segments, `false` otherwise.
+-- @return The number of open breach segments detected.
 local function update_breach_progress(record, surface)
   if not record.breach_positions then
     record.breach_open_segments = nil
@@ -3786,6 +4033,11 @@ local function assign_next_assault_target(record, group, site)
   return true
 end
 
+-- Selects a breach-side assault target for a support group and issues the appropriate move or attack command.
+-- If the group uses cone-style support, picks or updates a lane and may issue a safe move to that lane; otherwise ensures the group is at its support position before ordering an attack on the next breach target.
+-- @param record The stored group AI record (siege state, support mode, lane data, etc.).
+-- @param group The live unit group entity.
+-- @return `true` if a move or attack command was issued, `false` if no valid breach target (or lane) could be found.
 local function issue_support_breach_attack(record, group)
   local target_entity, target_position = find_next_breach_target(
     group.surface,
@@ -3995,6 +4247,14 @@ function runtime_ext.attach_cone_support_groups(record, site, ranged_members)
   end
 end
 
+-- Begins a siege at the given siege site by binding the stored group record to the site and initializing siege state.
+-- Updates the record's target/position fields, configures support mode (spawning support groups when applicable),
+-- computes breach-related fields, and issues the initial rally or exploitation commands as appropriate.
+-- May remove the record and return early if the live group has no members.
+-- @param record The persistent group record to update (mutated in-place).
+-- @param group The live unit group entity used to derive surface and member information.
+-- @param site The siege site data to begin siege against (will be normalized by the function).
+-- @return nil
 local function begin_siege(record, group, site)
   normalize_site(site)
   update_site_entry_positions(site, group.surface)
@@ -4120,6 +4380,10 @@ local function begin_siege(record, group, site)
   issue_safe_move(record, group, record.rally_position, 3, "siege-rally-covered")
 end
 
+-- Apply siege site data to a group's record by linking the site and copying its key metadata and positions.
+-- This updates the record's siege-related fields (site id, approach/support mode, breach plan, entry/exploit/rally positions, and entry flags).
+-- @param record The persistent group AI record to modify; existing siege-related fields will be replaced.
+-- @param site The normalized siege site object whose fields will be copied into the record.
 function apply_site_to_record(record, site)
   normalize_site(site)
   record.siege_site_id = site.key
@@ -4135,6 +4399,13 @@ function apply_site_to_record(record, site)
   record.entry_open = site.entry_open
 end
 
+-- Selects a nearby assault turret target for support units to follow, if available.
+-- Checks that the site has no active flamethrower turrets and returns the first assault turret
+-- whose assault group is currently staging or engaging and is within SUPPORT_FOLLOW_TRIGGER_DISTANCE.
+-- @param site Siege site table containing assault group lists and active flame turret info.
+-- @param surface Surface object used to resolve turret entities by position and name.
+-- @return turret The turret entity to follow, or `nil` if none found.
+-- @return assault_record The assault group's record associated with the turret, or `nil` if none found.
 function find_support_follow_target(site, surface)
   if site.active_flame_turrets and #site.active_flame_turrets > 0 then
     return nil, nil
@@ -4159,6 +4430,12 @@ function find_support_follow_target(site, surface)
   return nil, nil
 end
 
+-- Compute a safe follow position for a support group to hold fire behind a turret while keeping distance from the breach entry.
+-- Considers the group's maximum ranged reach, the site's entry (falls back to target), and samples lateral offsets to pick a walkable position closest to the group.
+-- @param group The group record (used for position, surface, and member ranges).
+-- @param site The siege site (uses `entry_position` or `target_position` as the reference).
+-- @param turret The turret entity to follow (uses `turret.position`).
+-- @return A position table `{x = number, y = number}` nearest the group among viable follow candidates, or `nil` if no follow position is appropriate (for example when the group's ranged members have insufficient range).
 function find_support_follow_position(group, site, turret)
   local _, ranged_range = get_group_ranged_members(group)
   if ranged_range <= 1.5 then
@@ -4199,6 +4476,10 @@ function find_support_follow_position(group, site, turret)
   return best_position
 end
 
+-- Advance a tracked group's state after breach planning: validate and refresh the siege site, update entry state and target selection, spawn assault splits from reserves, and transition the record into a reserve/assault posture or remove it if no members remain.
+-- May set the live group autonomous and remove the record if the site is missing, spawn new assault groups, emit an `interior_target_selected` debug event, and remove the record when all melee members are split off.
+-- @param record The stored group record being processed (will be modified: target fields, state, site linkage, etc.).
+-- @param group The live unit group corresponding to `record`.
 function handle_post_breach_planning(record, group)
   local site = get_site_for_record(record)
   if not site then
@@ -4250,6 +4531,10 @@ function handle_post_breach_planning(record, group)
   mark_reserve_record(record, group, site)
 end
 
+-- Handles an assault-role group's state machine: ensures the associated siege site and target turret exist, manages flamethrower lane staging versus engaging, and issues or clears movement/attack commands accordingly.
+-- May mark the live group autonomous and remove its record if the site is missing, reassign the next assault target if the turret is gone, switch the record between "assault-staging" and "assault-engaging", and emit a debug event when a flamethrower lane shifts.
+-- @param record The persistent group AI record for the assault group (will be mutated: state, lane_index, lane_positions, hazard_positions, commands).
+-- @param group The live unit group entity being controlled.
 function handle_assault_state(record, group)
   local site = get_site_for_record(record)
   if not site then
@@ -4320,6 +4605,12 @@ function handle_assault_state(record, group)
   end
 end
 
+-- Handles behavior for a support-role group when following and covering active assault groups at a siege site.
+-- Updates site lifetime and entry state, chooses follow targets, issues move or attack commands, and falls back to breach exploitation or support-position return as needed.
+-- Emits a `support_followup_started` debug event when a new turret follow is begun.
+-- @param record The stored group record tracking support state and commands.
+-- @param group The live unit group entity being controlled.
+-- @return None.
 function handle_support_following(record, group)
   local site = get_site_for_record(record)
   if not site then
@@ -4398,6 +4689,11 @@ function handle_support_following(record, group)
   end
 end
 
+-- Manage the lifecycle and runtime behavior of a support-role group, transitioning its state, issuing movement/attack orders, and cleaning up the record when the group finishes or fails.
+-- Handles: empty-group cleanup, script-control timeout, and the following states: `support-moving`, `support-resetting`, `support-sieging`, `support-following`, and `fallback-attack`. 
+-- In each state it advances entry/breach progress, issues safe move or breach-attack commands, detects drift/exposure and stall conditions, may reassign the group to autonomous control, and records breach-pressure loss events when appropriate.
+-- @param record The stored group record containing state, timers, positions, and support-specific metadata.
+-- @param group The live unit group entity being controlled.
 function handle_support_group(record, group)
   if count_group_members(group) == 0 then
     remove_group_record(record.id, false, "support-empty")
@@ -4514,6 +4810,10 @@ function handle_support_group(record, group)
   end
 end
 
+-- Advance a group's flanking progression: completes or retries waypoint moves, issues the next flank waypoint move, or falls back to a direct attack when flanking repeatedly fails.
+-- Updates `record` state/indices and issues movement/attack commands as needed.
+-- @param record The persistent group record being processed (modified in-place).
+-- @param group The live unit group entity associated with the record.
 function handle_flank_state(record, group)
   if command_finished(record, group) then
     local command_failed = record.command_result == defines.behavior_result.fail
@@ -4539,6 +4839,11 @@ function handle_flank_state(record, group)
   end
 end
 
+-- Advance a group's rallying state by transitioning when the rally command completes or ensuring the group moves toward its rally position.
+-- If the group's current command is finished, clears the command and sets the record state to `breach-waiting` when `record.waiting_for_breach` is true; otherwise sets the state to `attacking` and issues an attack against `record.target_position`.
+-- If no command is active, issues a safe move toward `record.rally_position`.
+-- @param record The stored group AI record being processed.
+-- @param group The live unit group entity associated with the record.
 function handle_rally_state(record, group)
   if command_finished(record, group) then
     clear_command(record)
@@ -4553,6 +4858,11 @@ function handle_rally_state(record, group)
   end
 end
 
+-- Handle a tracked group's waiting state while monitoring breach progress and transitioning to the next siege action.
+-- This function checks breach openness and turret exposure, may start post-breach planning or switch to attacking, will replan support mode if breach pressure times out, and issues/clears movement or attack commands as needed.
+-- @param record The stored group record being processed; may be mutated (state, commands, siege linkage, replans, timestamps).
+-- @param group The live unit group entity corresponding to the record; used for position, surface, and force queries.
+-- @return none
 function handle_breach_wait_state(record, group)
   local breach_open = update_breach_progress(record, group.surface)
   local exposed = #find_covering_turrets(group.surface, group.force, group.position) > 0
@@ -4615,6 +4925,9 @@ function handle_breach_wait_state(record, group)
   end
 end
 
+-- Manage a tracked group's "attack" state: update breach progress and transition to post-breach planning if a breach opens; otherwise maintain or issue attack commands against the next breach target (or the current target), clear completed commands, and finalize the record by setting the group autonomous and removing the stored record when the attack finishes.
+-- @param record The stored group AI record (table) for the tracked group.
+-- @param group The live unit group entity being controlled.
 function handle_attack_state(record, group)
   if record.siege_site_id and record.breach_positions then
     local breach_open = update_breach_progress(record, group.surface)
@@ -4646,6 +4959,9 @@ function handle_attack_state(record, group)
   end
 end
 
+-- Manage a group's "breach-exploiting" state by advancing the exploit action when its command completes or refreshing/issuing exploit commands while in-place; if the group has finished exploiting, transition it to autonomous and remove its tracking record.
+-- @param record The stored group record being processed.
+-- @param group The live unit group entity associated with the record.
 function handle_breach_exploiting_state(record, group)
   local site = get_site_for_record(record)
   if command_finished(record, group) then
@@ -4662,6 +4978,11 @@ function handle_breach_exploiting_state(record, group)
   end
 end
 
+-- Attach debug candidate data and a concise analysis summary to a group record.
+-- @param record The group record table to update; will receive `debug_candidates`, `debug_selected_candidate_index`, and `debug_analysis`.
+-- @param analysis The wall/network analysis result used to build candidate information.
+-- @param reference_position Position `{x,y}` used as the reference point for candidate scoring.
+-- @param selected_candidate Optional candidate object to mark as selected; may be `nil`.
 function update_record_analysis(record, analysis, reference_position, selected_candidate)
   local selected_key = selected_candidate and selected_candidate.key or nil
   record.debug_candidates, record.debug_selected_candidate_index = build_debug_candidates(analysis, reference_position, selected_key)
@@ -4673,6 +4994,12 @@ function update_record_analysis(record, analysis, reference_position, selected_c
   }
 end
 
+-- Decides the next high-level action for a tracked enemy group and issues the corresponding plan or command.
+-- This examines nearby reusable siege sites and wall contact points, runs wall-network analysis, scores candidate breach/contact positions,
+-- and then chooses one of: begin a siege, set up a flank and issue safe movement, select a direct attack target, or remove the record if contact is lost.
+-- The function updates the group's persistent record (target positions, state, flank waypoints, replans, and site linkage) and emits debug events for major decisions.
+-- @param record The persistent group record stored in runtime `storage.group_ai` for this tracked group.
+-- @param group The live Factorio unit group entity table corresponding to the record.
 function plan_group_action(record, group)
   local siege_site = find_nearby_siege_site(group)
   if siege_site then
@@ -4822,6 +5149,12 @@ function plan_group_action(record, group)
   issue_attack(record, group, record.target_position, record.target_force_name)
 end
 
+-- Process a tracked group record: update runtime diagnostics and advance its AI state machine.
+-- This updates the record's last-seen timestamp, position, surface and synchronized runtime diagnostics,
+-- then evaluates early-exit conditions (missing/empty group, script-control timeout, stalled state) and
+-- dispatches the record to the appropriate role/state handler. The function may start a fallback attack,
+-- convert the group to autonomous, or remove the record from tracking as part of processing.
+-- @param record_id The identifier of the group record in storage.group_ai to process.
 function process_group_record(record_id)
   local record = storage.group_ai[record_id]
   if not record then
@@ -4920,6 +5253,10 @@ function process_group_record(record_id)
 end
 
 do
+-- Renders the in-game debug overlay for all known siege sites and tracked group records.
+-- Draws labels, circles, and lines that visualize site targets/entries, group target vectors,
+-- turret and flame lane positions, hazard markers, flank waypoint routes, and debug candidate locations
+-- for the players returned by get_overlay_player_indices(). Does nothing if no overlay players are configured.
 function draw_debug_overlay()
   clear_debug_overlay()
 
@@ -5077,6 +5414,9 @@ function draw_debug_overlay()
   end
 end
 
+-- Processes pending debug arena waves, prunes expired siege sites, and advances the group processing queue.
+-- Iterates up to MAX_GROUPS_PER_PASS group records from storage.group_queue (rotating the cursor and removing stale ids) and calls process_group_record for each valid record.
+-- After processing, updates storage.group_queue_index to the next cursor position, optionally writes a snapshot when debug capture is enabled, and refreshes or clears the debug overlay for observing players.
 function process_tracked_groups()
   ensure_globals()
   process_debug_arena_waves()
@@ -5128,6 +5468,12 @@ function process_tracked_groups()
   end
 end
 
+-- Return a runtime debug summary containing counts and debug player indices.
+-- @return A table with the following fields:
+--   tracked: Number of group records currently stored.
+--   active: Number of stored groups that have been activated or are not in the "tracking" state.
+--   siege_sites: Number of known siege sites.
+--   debug_players: Array of player indices currently registered for debug capture/overlay.
 function get_debug_status()
   ensure_globals()
 
@@ -5292,6 +5638,15 @@ runtime_ext.setup_agent_bridge_scenario = function(scenario_name, player_index, 
   }
 end
 
+-- Handle the `/abt-debug` admin command to control debug capture and inspect runtime debug state.
+-- Supported subcommands:
+--   - `on`    : enable debug capture for the invoking player (or server when invoked from RCON) and write an initial manual dump.
+--   - `off`   : disable debug capture for the invoking player (or server) and clear overlay when capture is globally disabled.
+--   - `status`: print a brief summary of tracked groups, active records, siege sites, and a short list of recent debug events to the invoking player or server.
+--   - `dump`  : write a manual debug snapshot and events to disk.
+--   - `clear` : reset in-memory debug runtime state.
+-- Any other parameter causes the command to print the built-in help text to the invoker.
+-- @param command The Factorio command event table (expects `.parameter` and optional `.player_index`) provided by the console/command invocation.
 function command_debug(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
@@ -5385,6 +5740,11 @@ end
 do
 arena_runtime = {}
 
+-- Get or create the debug arena surface used for deterministic test scenarios.
+-- The surface is named by DEBUG_ARENA_SURFACE_NAME and is initialized with a fixed size,
+-- peaceful mode, disabled autoplace for resources/enemy bases/trees, generated chunks around the origin,
+-- and frozen daytime suitable for arena capture.
+-- @return The initialized debug arena `LuaSurface`.
 function arena_runtime.get_or_create_debug_surface()
   local surface = game.surfaces[DEBUG_ARENA_SURFACE_NAME]
   if surface and surface.valid then
@@ -5630,6 +5990,14 @@ function arena_runtime.build_wave_manifest(scenario)
   return waves
 end
 
+-- Spawns a debug enemy unit group for an arena scenario and registers it for tracking.
+-- Creates unit entities at the scenario or wave spawn position, adds them to a newly created enemy unit group,
+-- records a debug event, and links the group to the mod's group AI storage.
+-- @param surface The LuaSurface on which to spawn the group.
+-- @param scenario Table describing the arena scenario (must contain at minimum spawn/target positions and unit definitions).
+-- @param wave_data Optional table overriding scenario spawn/target positions and units for this wave.
+-- @param wave_index Optional numeric index identifying the wave; included in the debug event and stored on the group record.
+-- @return The created unit group entity, or `nil` if group creation failed.
 function arena_runtime.spawn_debug_group(surface, scenario, wave_data, wave_index)
   local spawn_position = wave_data and wave_data.spawn_position or scenario.spawn_position
   local target_position = wave_data and wave_data.target_position or scenario.target_position
@@ -5681,6 +6049,13 @@ function arena_runtime.spawn_debug_group(surface, scenario, wave_data, wave_inde
   return group
 end
 
+-- Build and persist the debug arena manifest for a scenario and write it to disk.
+-- Populates storage.debug.arena with scenario metadata, entity placement lists, wave manifests, expected assertions, and runtime counters, then writes the arena manifest file.
+-- @param surface The surface object where the arena is placed; its `name` is recorded.
+-- @param scenario Table describing the scenario (must include `name`, `observe_position`, `spawn_position`, `target_position`, `open_breach_positions`, and expected assertion fields).
+-- @param wall_anchor_positions Array of wall anchor positions to record for the manifest.
+-- @param turret_positions Array of turret positions to record for the manifest.
+-- @param structure_positions Array of additional structure positions to record for the manifest.
 function arena_runtime.build_debug_arena_manifest(surface, scenario, wall_anchor_positions, turret_positions, structure_positions)
   storage.debug.arena = {
     scenario = scenario.name,
@@ -5735,6 +6110,10 @@ process_debug_arena_waves = function()
   end
 end
 
+-- Creates a pre-seeded, reusable siege site for the given scenario on the provided surface when the scenario contains a `reuse_site` specification.
+-- The created site is stored in storage.siege_sites keyed by surface and breach center, its entry/inside positions are initialized, local assault targets are collected, and the site's TTL and wave count are set.
+-- @param surface The Factorio surface object on which to seed the reuse site.
+-- @param scenario Table containing scenario data; must include `reuse_site` and `open_breach_positions`. If `scenario.target_position` is present, it will be used to seed the site's inside rally/exploit positions.
 function arena_runtime.seed_reuse_site(surface, scenario)
   if not scenario.reuse_site then
     return
@@ -5781,6 +6160,11 @@ function arena_runtime.seed_reuse_site(surface, scenario)
   collect_local_assault_targets(surface, site)
 end
 
+-- Sets up a debug arena scenario named by the command parameter and announces its creation.
+-- 
+-- Parses the provided command parameter as a scenario name, creates the scenario via the agent-bridge setup routine,
+-- and prints creation and expected-behavior messages to the invoking player (or to global chat for server invocation).
+-- @param command The Factorio command event table; expected to include `parameter` (scenario name) and `player_index`.
 function command_debug_arena(command)
   ensure_globals()
   local player, allowed = require_admin_or_server(command)
@@ -5963,6 +6347,11 @@ remote.add_interface("agent_bridge", {
     )
 
     if scenario then
+      -- Finds the first event in the current `events` list matching `event_name` and an optional predicate.
+      -- @param event_name The name of the event to search for.
+      -- @param predicate Optional function(event) -> boolean called to further filter matching events.
+      -- @return event The first matching event or `nil` if none found.
+      -- @return index The 1-based index of the matching event in `events` or `nil` if none found.
       local function find_first_event(event_name, predicate)
         for index = 1, #events do
           local event = events[index]
@@ -5973,6 +6362,10 @@ remote.add_interface("agent_bridge", {
         return nil, nil
       end
 
+      -- Determines whether a recorded debug event with the given name exists and (optionally) satisfies a predicate.
+      -- @param event_name The name of the event to search for.
+      -- @param predicate Optional. A function(event) -> boolean used to further filter matching events.
+      -- @return `true` if a matching event exists, `false` otherwise.
       local function has_event(event_name, predicate)
         return find_first_event(event_name, predicate) ~= nil
       end
