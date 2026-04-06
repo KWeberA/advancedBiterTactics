@@ -24,6 +24,7 @@ local DESIRED_BREACH_SEGMENTS = 3
 local MIN_BREACH_SEGMENTS = 2
 local SUPPORT_MAX_DRIFT = 4
 local SUPPORT_RETURN_RADIUS = 2
+local MOVE_REASSERT_TICKS = 60
 local BREACH_TARGET_RADIUS = 0.6
 local BREACH_TARGET_SEARCH_DISTANCE = 3.1
 local LOCAL_ASSAULT_RADIUS = 32
@@ -100,6 +101,8 @@ DEBUG_EVENT_NAMES = {
   interior_target_selected = true,
   breach_reused = true,
   coverage_violation = true,
+  command_reasserted = true,
+  unsafe_rally_replanned = true,
   state_stalled = true,
   support_mode_replanned = true,
   entry_progress_updated = true,
@@ -117,6 +120,7 @@ write_manual_dump = nil
 set_debug_enabled = nil
 clear_debug_runtime = nil
 get_runtime_group_diagnostics = nil
+find_covering_turrets = nil
 sample_line_positions = nil
 serialize_turret_sources = nil
 clear_command = nil
@@ -912,9 +916,12 @@ local function serialize_record(record)
     inside_rally_position = serialize_position(record.inside_rally_position),
     exploit_position = serialize_position(record.exploit_position),
     command_kind = record.command_kind,
+    command_distraction = record.command_distraction,
     command_status = record.command_status,
     command_result = record.command_result,
     command_target_position = serialize_position(record.command_target_position),
+    group_state = group and group.is_unit_group and group.state or nil,
+    script_command_preserved = record.command_status == "active",
     last_contact_position = serialize_position(record.last_contact_position),
     breach_positions = serialize_positions(record.breach_positions),
     breach_attack_order = serialize_positions(record.breach_attack_order),
@@ -1097,6 +1104,11 @@ local function record_debug_event(event_name, record, extra)
     state_duration_ticks = record and record.state_since_tick and (game.tick - record.state_since_tick) or nil,
     last_meaningful_progress_tick = record and record.last_meaningful_progress_tick or nil,
     entry_progress = extra and extra.entry_progress or (record and record.entry_progress or nil),
+    command_kind = extra and extra.command_kind or (record and record.command_kind or nil),
+    command_distraction = extra and extra.command_distraction or (record and record.command_distraction or nil),
+    command_target_position = serialize_position(extra and extra.command_target_position or (record and record.command_target_position or nil)),
+    group_state = group and group.is_unit_group and group.state or nil,
+    script_command_preserved = extra and extra.script_command_preserved or ((record and record.command_status == "active") or nil),
     coverage_sources = extra and extra.coverage_sources or nil,
     covering_turret_count = extra and extra.covering_turret_count or nil,
     in_turret_coverage = extra and extra.in_turret_coverage or nil,
@@ -1328,7 +1340,7 @@ local function is_position_walkable(surface, position, probe_unit_name)
   })
 end
 
-local function find_covering_turrets(surface, enemy_force, position)
+find_covering_turrets = function(surface, enemy_force, position)
   local nearby_turrets = surface.find_entities_filtered({
     position = position,
     radius = 32,
@@ -1834,7 +1846,7 @@ local function build_flank_waypoints(analysis, current_candidate, best_candidate
 end
 
 function runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate)
-  if not (analysis and analysis.closed and current_candidate and best_candidate and current_candidate.outside_position and best_candidate.outside_position) then
+  if not (analysis and current_candidate and best_candidate and current_candidate.outside_position and best_candidate.outside_position) then
     return {}
   end
 
@@ -1907,6 +1919,30 @@ function runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate
     routes[2] = {
       {x = east_x, y = south_y},
       {x = east_x, y = north_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "west" and best_candidate.outside_direction == "west" then
+    routes[1] = {
+      {x = west_x, y = current.y},
+      {x = west_x, y = best.y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "east" and best_candidate.outside_direction == "east" then
+    routes[1] = {
+      {x = east_x, y = current.y},
+      {x = east_x, y = best.y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "north" and best_candidate.outside_direction == "north" then
+    routes[1] = {
+      {x = current.x, y = north_y},
+      {x = best.x, y = north_y},
+      copy_position(best)
+    }
+  elseif current_candidate.outside_direction == "south" and best_candidate.outside_direction == "south" then
+    routes[1] = {
+      {x = current.x, y = south_y},
+      {x = best.x, y = south_y},
       copy_position(best)
     }
   else
@@ -2898,6 +2934,7 @@ end
 local function begin_command(record, kind, target_position, radius, timeout)
   record.activated_tick = record.activated_tick or game.tick
   record.command_kind = kind
+  record.command_distraction = record.pending_command_distraction or defines.distraction.none
   record.command_status = "active"
   record.command_result = defines.behavior_result.in_progress
   record.command_target_position = target_position and copy_position(target_position) or nil
@@ -2909,6 +2946,7 @@ end
 
 clear_command = function(record)
   record.command_kind = nil
+  record.command_distraction = nil
   record.command_status = nil
   record.command_result = nil
   record.command_target_position = nil
@@ -2916,6 +2954,10 @@ clear_command = function(record)
   record.command_issued_tick = nil
   record.command_timeout = nil
   record.command_completed_tick = nil
+end
+
+local function get_script_attack_distraction(_record)
+  return defines.distraction.none
 end
 
 local function mark_command_complete(record, result, tick)
@@ -2941,6 +2983,17 @@ local function command_finished(record, group)
       mark_command_complete(record, defines.behavior_result.success, game.tick)
       return true
     end
+  end
+
+  if record.command_kind == "move"
+    and group.is_unit_group
+    and group.state == defines.group_state.gathering
+    and record.command_target_position
+    and distance_sq(group.position, record.command_target_position) > (record.command_radius or 3) * (record.command_radius or 3) then
+    if game.tick - record.command_issued_tick >= PROCESS_INTERVAL then
+      group.start_moving()
+    end
+    return false
   end
 
   if not group.has_command and game.tick - record.command_issued_tick >= PROCESS_INTERVAL then
@@ -3172,6 +3225,7 @@ local function find_attack_target(surface, position, defense_force_name)
 end
 
 local function issue_move(record, group, position, radius)
+  record.pending_command_distraction = defines.distraction.none
   group.set_command({
     type = defines.command.go_to_location,
     destination = position,
@@ -3184,6 +3238,7 @@ local function issue_move(record, group, position, radius)
   end
 
   begin_command(record, "move", position, radius or 3, MOVE_COMMAND_TIMEOUT)
+  record.pending_command_distraction = nil
 end
 
 local function issue_safe_move(record, group, position, radius, reason)
@@ -3205,21 +3260,60 @@ local function issue_safe_move(record, group, position, radius, reason)
   return true
 end
 
+local function reassert_move_command(record, group, position, radius, reason, use_safe_move)
+  if not (record and group and record.command_kind == "move" and record.command_status == "active" and record.command_target_position) then
+    return false
+  end
+
+  local completion_radius = radius or record.command_radius or 3
+  if distance_sq(group.position, record.command_target_position) <= completion_radius * completion_radius then
+    return false
+  end
+
+  if game.tick - (record.command_issued_tick or game.tick) < MOVE_REASSERT_TICKS then
+    return false
+  end
+
+  record_debug_event("command_reasserted", record, {
+    reason = reason or "move-stuck",
+    target_position = position or record.command_target_position,
+    command_kind = record.command_kind,
+    command_distraction = record.command_distraction,
+    command_target_position = record.command_target_position,
+    script_command_preserved = true
+  })
+
+  if group.is_unit_group and group.state == defines.group_state.gathering then
+    group.start_moving()
+    record.command_issued_tick = game.tick
+    return true
+  end
+
+  clear_command(record)
+  if use_safe_move then
+    return issue_safe_move(record, group, position or record.command_target_position, completion_radius, reason)
+  end
+
+  issue_move(record, group, position or record.command_target_position, completion_radius)
+  return true
+end
+
 local function issue_attack(record, group, target_position, defense_force_name)
   local target_entity = find_attack_target(group.surface, target_position, defense_force_name)
+  local distraction = get_script_attack_distraction(record)
 
   if target_entity then
     group.set_command({
       type = defines.command.attack,
       target = target_entity,
-      distraction = defines.distraction.by_enemy
+      distraction = distraction
     })
   else
     group.set_command({
       type = defines.command.attack_area,
       destination = target_position,
       radius = ATTACK_RADIUS,
-      distraction = defines.distraction.by_enemy
+      distraction = distraction
     })
   end
 
@@ -3227,7 +3321,9 @@ local function issue_attack(record, group, target_position, defense_force_name)
     group.start_moving()
   end
 
+  record.pending_command_distraction = distraction
   begin_command(record, "attack", target_position, ATTACK_RADIUS, ATTACK_COMMAND_TIMEOUT)
+  record.pending_command_distraction = nil
 end
 
 local function issue_attack_entity(record, group, target_entity)
@@ -3238,18 +3334,21 @@ local function issue_attack_entity(record, group, target_entity)
   record.target_position = copy_position(target_entity.position)
   record.target_turret_position = copy_position(target_entity.position)
   record.target_turret_name = target_entity.name
+  local distraction = get_script_attack_distraction(record)
 
   group.set_command({
     type = defines.command.attack,
     target = target_entity,
-    distraction = defines.distraction.by_enemy
+    distraction = distraction
   })
 
   if group.is_unit_group then
     group.start_moving()
   end
 
+  record.pending_command_distraction = distraction
   begin_command(record, "attack", target_entity.position, ATTACK_RADIUS, ATTACK_COMMAND_TIMEOUT)
+  record.pending_command_distraction = nil
   return true
 end
 
@@ -3890,7 +3989,7 @@ local function attach_support_group(record, site, ranged_members)
   record.support_spawned = true
 
   local support_group = record.group.surface.create_unit_group({
-    position = record.group.position,
+    position = site.support_position or record.group.position,
     force = record.group.force
   })
 
@@ -3953,7 +4052,12 @@ function runtime_ext.attach_cone_support_groups(record, site, ranged_members)
     local member_count = math.ceil(#ranged_members / remaining_groups)
     local allocated_members = allocate_members(ranged_members, member_count)
     local lane_index = math.min(lane_indices[split_index] or math.ceil(#lane_positions / 2), #lane_positions)
-    local split_group, moved_members = create_split_group(record.group.surface, record.group.force, record.group.position, allocated_members)
+    local split_group, moved_members = create_split_group(
+      record.group.surface,
+      record.group.force,
+      lane_positions[lane_index] or record.group.position,
+      allocated_members
+    )
     moved_members = moved_members or 0
 
     if split_group and moved_members > 0 then
@@ -4411,7 +4515,23 @@ function handle_support_group(record, group)
 
   if record.state == "support-moving" then
     if command_finished(record, group) then
+      local move_failed = record.command_kind == "move"
+        and record.support_position
+        and distance_sq(group.position, record.support_position) > SUPPORT_RETURN_RADIUS * SUPPORT_RETURN_RADIUS
       clear_command(record)
+      if move_failed then
+        record_debug_event("command_reasserted", record, {
+          reason = "support-moving-command-failed",
+          target_position = record.support_position,
+          command_kind = "move",
+          command_distraction = defines.distraction.none,
+          command_target_position = record.support_position,
+          script_command_preserved = false
+        })
+        issue_safe_move(record, group, record.support_position, 3, "support-moving-covered")
+        return
+      end
+
       local site = get_site_for_record(record)
       if site and runtime_ext.site_has_reusable_entry(site, group.surface) then
         record.entry_open = true
@@ -4426,17 +4546,37 @@ function handle_support_group(record, group)
       end
     elseif not record.command_status then
       issue_safe_move(record, group, record.support_position, 3, "support-moving-covered")
+    elseif reassert_move_command(record, group, record.support_position, 3, "support-moving-stuck", true) then
+      return
     end
     return
   end
 
   if record.state == "support-resetting" then
     if command_finished(record, group) then
+      local move_failed = record.command_kind == "move"
+        and record.support_position
+        and distance_sq(group.position, record.support_position) > SUPPORT_RETURN_RADIUS * SUPPORT_RETURN_RADIUS
       clear_command(record)
+      if move_failed then
+        record_debug_event("command_reasserted", record, {
+          reason = "support-reset-command-failed",
+          target_position = record.support_position,
+          command_kind = "move",
+          command_distraction = defines.distraction.none,
+          command_target_position = record.support_position,
+          script_command_preserved = false
+        })
+        issue_safe_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS, "support-reset-covered")
+        return
+      end
+
       record.state = "support-sieging"
       note_meaningful_progress(record, group.position)
     elseif not record.command_status then
       issue_safe_move(record, group, record.support_position, SUPPORT_RETURN_RADIUS, "support-reset-covered")
+    elseif reassert_move_command(record, group, record.support_position, SUPPORT_RETURN_RADIUS, "support-resetting-stuck", true) then
+      return
     end
     return
   end
@@ -4541,7 +4681,23 @@ end
 
 function handle_rally_state(record, group)
   if command_finished(record, group) then
+    local move_failed = record.command_kind == "move"
+      and record.rally_position
+      and distance_sq(group.position, record.rally_position) > 9
     clear_command(record)
+    if move_failed then
+      record_debug_event("command_reasserted", record, {
+        reason = "rally-command-failed",
+        target_position = record.rally_position,
+        command_kind = "move",
+        command_distraction = defines.distraction.none,
+        command_target_position = record.rally_position,
+        script_command_preserved = false
+      })
+      issue_safe_move(record, group, record.rally_position, 3, "rally-covered")
+      return
+    end
+
     if record.waiting_for_breach then
       record.state = "breach-waiting"
     else
@@ -4549,7 +4705,19 @@ function handle_rally_state(record, group)
       issue_attack(record, group, record.target_position, record.target_force_name)
     end
   elseif not record.command_status then
+    if record.command_kind and record.command_kind ~= "move" then
+      record_debug_event("command_reasserted", record, {
+        reason = "rally-safe-move",
+        target_position = record.rally_position,
+        command_kind = record.command_kind,
+        command_distraction = record.command_distraction,
+        command_target_position = record.command_target_position,
+        script_command_preserved = false
+      })
+    end
     issue_safe_move(record, group, record.rally_position, 3, "rally-covered")
+  elseif reassert_move_command(record, group, record.rally_position, 3, "rally-move-stuck", true) then
+    return
   end
 end
 
@@ -4606,11 +4774,21 @@ function handle_breach_wait_state(record, group)
     if command_finished(record, group) then
       clear_command(record)
     elseif exposed and record.command_kind ~= "move" then
+      record_debug_event("command_reasserted", record, {
+        reason = "breach-wait-safe-move",
+        target_position = record.rally_position,
+        command_kind = record.command_kind,
+        command_distraction = record.command_distraction,
+        command_target_position = record.command_target_position,
+        script_command_preserved = false
+      })
       clear_command(record)
     end
 
     if not record.command_status or record.command_kind ~= "move" then
       issue_safe_move(record, group, record.rally_position, 3, "breach-wait-covered")
+    elseif reassert_move_command(record, group, record.rally_position, 3, "breach-wait-move-stuck", true) then
+      return
     end
   end
 end
@@ -4671,6 +4849,85 @@ function update_record_analysis(record, analysis, reference_position, selected_c
     truncated = analysis.truncated,
     candidate_count = #analysis.candidates
   }
+end
+
+local function site_rally_is_safe(group, site)
+  if not (group and site and site.rally_position) then
+    return false, "missing-rally-position"
+  end
+
+  local covering_turrets = find_covering_turrets(group.surface, group.force, site.rally_position)
+  if #covering_turrets > 0 then
+    return false, "siege-rally-covered"
+  end
+
+  local path_covered = path_has_turret_coverage(group.surface, group.force, group.position, site.rally_position)
+  if path_covered then
+    return false, "siege-rally-path-covered"
+  end
+
+  return true, nil
+end
+
+local function try_activate_flank_route(record, group, flank_waypoints, best_candidate, reason)
+  if not (flank_waypoints and #flank_waypoints > 0 and best_candidate and best_candidate.entity and best_candidate.entity.valid) then
+    return false
+  end
+
+  record.replans = record.replans + 1
+  record.target_position = copy_position(best_candidate.position)
+  record.target_force_name = best_candidate.entity.force.name
+  record.flank_waypoints = flank_waypoints
+  record.flank_index = 1
+  record.state = "flanking"
+
+  if reason then
+    record_debug_event("unsafe_rally_replanned", record, {
+      reason = reason,
+      target_position = flank_waypoints[1],
+      selected_candidate_index = record.debug_selected_candidate_index,
+      command_kind = record.command_kind,
+      command_distraction = record.command_distraction,
+      command_target_position = record.command_target_position
+    })
+  end
+
+  record_debug_event("flank_waypoint_set", record, {
+    reason = reason or "better-flank",
+    target_position = flank_waypoints[1],
+    selected_candidate_index = record.debug_selected_candidate_index
+  })
+
+  if not issue_safe_move(record, group, flank_waypoints[1], 2, "flank-waypoint-covered") then
+    record.state = "tracking"
+    record.flank_waypoints = nil
+    record.flank_index = nil
+    return false
+  end
+
+  return true
+end
+
+local function try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, site)
+  if not (site and site.support_mode == "none" and current_candidate and best_candidate and record.replans < MAX_REPLANS) then
+    return false
+  end
+
+  local rally_safe, unsafe_reason = site_rally_is_safe(group, site)
+  if rally_safe then
+    return false
+  end
+
+  local flank_waypoints = runtime_ext.choose_safe_flank_route(
+    group,
+    runtime_ext.build_perimeter_flank_waypoints(analysis, current_candidate, best_candidate),
+    best_candidate.outside_position
+  )
+  if #flank_waypoints == 0 then
+    return false
+  end
+
+  return try_activate_flank_route(record, group, flank_waypoints, best_candidate, unsafe_reason)
 end
 
 function plan_group_action(record, group)
@@ -4767,18 +5024,7 @@ function plan_group_action(record, group)
       )
     end
     if #flank_waypoints > 0 then
-      record.replans = record.replans + 1
-      record.target_position = copy_position(best_candidate.position)
-      record.target_force_name = best_candidate.entity.force.name
-      record.flank_waypoints = flank_waypoints
-      record.flank_index = 1
-      record.state = "flanking"
-      record_debug_event("flank_waypoint_set", record, {
-        reason = "better-flank",
-        target_position = flank_waypoints[1],
-        selected_candidate_index = record.debug_selected_candidate_index
-      })
-      if not issue_safe_move(record, group, flank_waypoints[1], 2, "flank-waypoint-covered") then
+      if not try_activate_flank_route(record, group, flank_waypoints, best_candidate, "better-flank") then
         local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
         begin_siege(record, group, siege_site_record)
       end
@@ -4787,6 +5033,9 @@ function plan_group_action(record, group)
 
     if current_candidate.cover_count > 0 and best_candidate.cover_count == 0 then
       local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+      if try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, siege_site_record) then
+        return
+      end
       begin_siege(record, group, siege_site_record)
       return
     end
@@ -4797,6 +5046,9 @@ function plan_group_action(record, group)
     local _, support_position = find_staging_positions(group, best_candidate, analysis)
     if support_position then
       local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+      if try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, siege_site_record) then
+        return
+      end
       begin_siege(record, group, siege_site_record)
       return
     end
@@ -4804,6 +5056,9 @@ function plan_group_action(record, group)
 
   if analysis.closed and analysis.fully_covered and best_candidate then
     local siege_site_record = get_or_create_siege_site(group, best_candidate, analysis)
+    if try_replan_unsafe_rally(record, group, analysis, current_candidate, best_candidate, siege_site_record) then
+      return
+    end
     begin_siege(record, group, siege_site_record)
     return
   end
